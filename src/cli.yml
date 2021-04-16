@@ -19,7 +19,7 @@ args:
                   multiple: false
 
         - source-dir:
-                  help: Directory from where snapshots should be created.
+                  help: Directory from where snapshots should be created. It can also be used to specify the directory where a snapshot will be restored.
                   long: from
                   takes_value: true
                   multiple: false

@@ -45,7 +45,9 @@ pub fn manage_restoring(args: &mut Args) -> Result<()> {
     let snapshot_data = database::return_snapshot_data(&connection, args)?;
     if !snapshot_data.snap_id.is_empty() {
         args.snapshot_name = snapshot_data.destination + &snapshot_data.name;
-        args.source_dir = snapshot_data.source;
+        if args.source_dir.is_empty() {
+            args.source_dir = snapshot_data.source;
+        }
     } else {
         eprintln!(
             "Snapshot ID {} does not returned any data. Please double check the ID.",
