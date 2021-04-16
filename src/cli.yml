@@ -1,0 +1,88 @@
+name: Rusnapshot
+author: Eduard Tolosa <edu4rdshl@protonmail.com>
+settings:
+        - ArgRequiredElseHelp
+        - StrictUtf8
+about: Simple and handy btrfs snapshoting tool.
+args:
+        - config-file:
+                  help: Path to configuration file.
+                  short: c
+                  long: config
+                  takes_value: true
+                  multiple: false
+
+        - dest-dir:
+                  help: Directory where snapshots should be saved.
+                  long: to
+                  takes_value: true
+                  multiple: false
+
+        - source-dir:
+                  help: Directory from where snapshots should be created.
+                  long: from
+                  takes_value: true
+                  multiple: false
+
+        - snapshot-id:
+                  help: Snapshot id or name to work with.
+                  long: id
+                  takes_value: true
+                  multiple: false
+
+        - database-file:
+                  help: Path to the SQLite database file.
+                  short: d
+                  long: dfile
+                  takes_value: true
+                  multiple: false
+
+        - snapshot-prefix:
+                  help: "Prefix for the snapshot name. Default: snapshot"
+                  short: p
+                  long: prefix
+                  takes_value: true
+                  multiple: false
+
+        - create-snapshot:
+                  help: Create an snapshot.
+                  long: cr
+                  takes_value: false
+                  multiple: false
+
+        - clean-snapshots:
+                  help: "Enable snapshots cleaning, will keep only the last X snapshots specified with -k/--keep. WARNING: if -k/--keep is not specified, IT WILL DELETE ALL THE SNAPSHOTS."
+                  long: clean
+                  takes_value: false
+                  multiple: false
+
+        - delete-snapshot:
+                  help: Delete an snapshot.
+                  long: del
+                  takes_value: false
+                  multiple: false
+                  requires:
+                          - snapshot-id
+
+        - restore-snapshot:
+                  help: Restore an specific snapshot.
+                  short: r
+                  long: restore
+                  takes_value: false
+                  multiple: false
+                  requires:
+                          - snapshot-id
+
+        - list-snapshots:
+                  help: List the snapshots tracked in the database.
+                  short: l
+                  long: list
+                  takes_value: false
+                  multiple: false
+
+        - keep-only:
+                  help: Keep only the last X items.
+                  short: k
+                  long: keep
+                  takes_value: true
+                  multiple: false

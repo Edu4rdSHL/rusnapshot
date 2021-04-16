@@ -1,0 +1,18 @@
+[package]
+name = "rusnapshot"
+version = "0.1.0"
+authors = ["edu4rdshl"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "2.33.3", features = ["yaml"] }
+reqwest = { version = "0.11.3", features = ["default-tls"] }
+openssl = { version = "0.10.30", features = ["vendored"] }
+config = { version = "0.11.0", features = ["yaml", "json", "toml", "hjson", "ini"] }
+failure = "0.1.8"
+sqlite = "0.26.0"
+md5 = "0.7.0"
+chrono = "0.4.19"
+prettytable-rs = "0.8.0"
