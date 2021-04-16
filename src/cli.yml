@@ -44,6 +44,12 @@ args:
                   takes_value: true
                   multiple: false
 
+        - snapshot-kind:
+                  help: "Used to specify a differentiator between snapshots with the same prefix. Default: rusnapshot"
+                  long: kind
+                  takes_value: true
+                  multiple: false
+
         - create-snapshot:
                   help: Create an snapshot.
                   long: cr

@@ -77,6 +77,7 @@ pub fn manage_listing(args: &mut Args) -> Result<()> {
     table.set_titles(row![
         bcFg => "NAME",
        "ID",
+       "KIND",
        "SOURCE DIR",
        "DESTINATION DIR",
        "DATE"
@@ -86,6 +87,7 @@ pub fn manage_listing(args: &mut Args) -> Result<()> {
         table.add_row(row![ d =>
             data.name,
             data.snap_id,
+            data.kind,
             data.source,
             data.destination,
             data.date,

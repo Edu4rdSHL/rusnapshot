@@ -11,12 +11,14 @@ pub struct Args {
     pub snapshot_name: String,
     pub snapshot_id: String,
     pub snapshot_prefix: String,
+    pub snapshot_kind: String,
     pub keep_only: usize,
 }
 
 pub struct Database {
     pub name: String,
     pub snap_id: String,
+    pub kind: String,
     pub source: String,
     pub destination: String,
     pub date: String,
@@ -27,6 +29,7 @@ impl Database {
         Database {
             name: String::new(),
             snap_id: String::new(),
+            kind: String::new(),
             source: String::new(),
             destination: String::new(),
             date: String::new(),

@@ -40,6 +40,12 @@ pub fn get_args() -> Args {
         } else {
             return_value_or_default(&settings, "snapshot_prefix", String::from("snapshot"))
         },
+        snapshot_kind: if matches.is_present("snapshot-kind") {
+            value_t!(matches, "snapshot-kind", String)
+                .unwrap_or_else(|_| String::from("rusnapshot"))
+        } else {
+            return_value_or_default(&settings, "snapshot_kind", String::from("rusnapshot"))
+        },
         keep_only: if matches.is_present("keep-only") {
             value_t!(matches, "keep-only", usize).unwrap_or_else(|_| 0)
         } else {
