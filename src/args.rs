@@ -28,14 +28,9 @@ pub fn get_args() -> Args {
             return_value_or_default(&settings, "source_dir", String::new())
         },
         database_file: if matches.is_present("database-file") {
-            value_t!(matches, "database-file", String)
-                .unwrap_or_else(|_| String::from("rusnapshot.sqlite"))
+            value_t!(matches, "database-file", String).unwrap_or_else(|_| String::new())
         } else {
-            return_value_or_default(
-                &settings,
-                "database_file",
-                String::from("rusnapshot.sqlite"),
-            )
+            return_value_or_default(&settings, "database_file", String::new())
         },
         snapshot_name: String::new(),
         snapshot_id: value_t!(matches, "snapshot-id", String).unwrap_or_else(|_| String::new()),

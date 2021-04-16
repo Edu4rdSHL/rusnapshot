@@ -5,6 +5,14 @@ use {
 
 fn run() -> Result<()> {
     let mut arguments = args::get_args();
+
+    if arguments.database_file.is_empty() {
+        eprintln!(
+            "Please specify a database file with -d/--dfile or the database_file option in the config file, it's required for all the operations, leaving."
+        );
+        std::process::exit(1)
+    }
+
     database::test_database(&arguments.database_file)?;
     database::setup_initial_database(&sqlite::open(&arguments.database_file)?)?;
 
