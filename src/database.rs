@@ -8,6 +8,7 @@ use {
 
 pub fn test_database(connection_str: &str) -> Result<()> {
     let connection = sqlite::open(&connection_str)?;
+    connection.execute("PRAGMA journal_mode=WAL")?;
     drop(connection);
 
     Ok(())
