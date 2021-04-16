@@ -11,7 +11,7 @@ pub fn manage_creation(args: &mut Args) -> Result<()> {
     args.snapshot_name = format!(
         "{}-{}",
         args.snapshot_prefix,
-        Utc::now().format("%Y-%m-%d-%H-%M-%S")
+        Utc::now().format("%Y-%m-%d-%H-%M-%S-%6f")
     );
     args.snapshot_id = format!("{:?}", md5::compute(&args.snapshot_name));
     if operations::take_snapshot(args) {
