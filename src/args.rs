@@ -17,6 +17,7 @@ pub fn get_args() -> Args {
         list_snapshots: matches.is_present("list-snapshots"),
         clean_snapshots: matches.is_present("clean-snapshots") || matches.is_present("keep-only"),
         restore_snapshot: matches.is_present("restore-snapshot"),
+        rw_snapshots: matches.is_present("read-write"),
         dest_dir: if matches.is_present("dest-dir") {
             value_t!(matches, "dest-dir", String).unwrap_or_else(|_| String::new())
         } else {
@@ -45,6 +46,11 @@ pub fn get_args() -> Args {
                 .unwrap_or_else(|_| String::from("rusnapshot"))
         } else {
             return_value_or_default(&settings, "snapshot_kind", String::from("rusnapshot"))
+        },
+        snapshot_ro_rw: if matches.is_present("read-write") {
+            "read-write".to_string()
+        } else {
+            "read-only".to_string()
         },
         keep_only: if matches.is_present("keep-only") {
             value_t!(matches, "keep-only", usize).unwrap_or_else(|_| 0)

@@ -80,6 +80,7 @@ pub fn manage_listing(args: &mut Args) -> Result<()> {
        "KIND",
        "SOURCE DIR",
        "DESTINATION DIR",
+       "RO/RW",
        "DATE"
     ]);
 
@@ -90,6 +91,7 @@ pub fn manage_listing(args: &mut Args) -> Result<()> {
             data.kind,
             data.source,
             data.destination,
+            data.ro_rw,
             data.date,
         ]);
     }

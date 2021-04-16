@@ -50,6 +50,13 @@ args:
                   takes_value: true
                   multiple: false
 
+        - keep-only:
+                  help: Keep only the last X items.
+                  short: k
+                  long: keep
+                  takes_value: true
+                  multiple: false
+
         - create-snapshot:
                   help: Create an snapshot.
                   long: cr
@@ -86,9 +93,9 @@ args:
                   takes_value: false
                   multiple: false
 
-        - keep-only:
-                  help: Keep only the last X items.
-                  short: k
-                  long: keep
-                  takes_value: true
+        - read-write:
+                  help: Create read-write/rw snapshots.
+                  short: w
+                  long: rw
+                  takes_value: false
                   multiple: false
