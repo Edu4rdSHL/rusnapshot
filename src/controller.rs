@@ -52,10 +52,6 @@ pub fn manage_restoring(args: &mut Args) -> Result<()> {
             args.snapshot_id
         )
     }
-    println!(
-        "ID: {}, NAME: {}, Rest Point: {}",
-        args.snapshot_id, args.snapshot_name, args.source_dir
-    );
     if !args.snapshot_name.is_empty() && operations::restore_snapshot(args) {
         println!(
             "The snapshot with ID {} was successfully restored to {}",
