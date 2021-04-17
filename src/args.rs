@@ -42,8 +42,9 @@ pub fn get_args() -> Args {
             } else {
                 match sqlite::open(&db_file_path) {
                     Ok(mut connection) => {
+                        let timeout = value_t!(matches, "timeout", usize).unwrap_or_else(|_| 5000);
                         connection
-                            .set_busy_timeout(5000)
+                            .set_busy_timeout(timeout)
                             .expect("Failed to set database timeout");
                         connection
                     }

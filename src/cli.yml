@@ -57,6 +57,12 @@ args:
                   takes_value: true
                   multiple: false
 
+        - timeout:
+                  help: "Time in milliseconds until SQLite can return a timeout (Do not touch if you don't know what you are doing). Default: 5000"
+                  long: timeout
+                  takes_value: true
+                  multiple: false
+
         - create-snapshot:
                   help: Create an snapshot.
                   long: cr
