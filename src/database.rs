@@ -3,7 +3,7 @@ use {
         errors::*,
         structs::{Args, Database},
     },
-    sqlite::{Connection, State},
+    sqlite::{Connection, State, Statement},
 };
 
 pub fn test_database(connection_str: &str) -> Result<()> {
@@ -48,13 +48,7 @@ pub fn return_snapshot_data(connection: &Connection, args: &Args) -> Result<Data
     let mut snap_data = Database::default();
 
     while let State::Row = statement.next()? {
-        snap_data.name = statement.read::<String>(0).unwrap();
-        snap_data.snap_id = statement.read::<String>(1).unwrap();
-        snap_data.kind = statement.read::<String>(2).unwrap();
-        snap_data.source = statement.read::<String>(3).unwrap();
-        snap_data.destination = statement.read::<String>(4).unwrap();
-        snap_data.ro_rw = statement.read::<String>(5).unwrap();
-        snap_data.date = statement.read::<String>(6).unwrap();
+        snap_data = populate_db_struct(&statement, snap_data)?;
     }
 
     Ok(snap_data)
@@ -66,17 +60,8 @@ pub fn return_all_data(connection: &Connection) -> Result<Vec<Database>> {
     let mut statement = connection.prepare("SELECT * FROM snapshots ORDER BY date DESC")?;
 
     while let State::Row = statement.next()? {
-        let mut db_struct = Database::default();
-
-        db_struct.name = statement.read::<String>(0).unwrap();
-        db_struct.snap_id = statement.read::<String>(1).unwrap();
-        db_struct.kind = statement.read::<String>(2).unwrap();
-        db_struct.source = statement.read::<String>(3).unwrap();
-        db_struct.destination = statement.read::<String>(4).unwrap();
-        db_struct.ro_rw = statement.read::<String>(5).unwrap();
-        db_struct.date = statement.read::<String>(6).unwrap();
-
-        snapshots_data.push(db_struct);
+        let db_struct = Database::default();
+        snapshots_data.push(populate_db_struct(&statement, db_struct)?);
     }
 
     Ok(snapshots_data)
@@ -88,18 +73,20 @@ pub fn return_only_x_items(connection: &Connection, args: &Args) -> Result<Vec<D
     let mut statement = connection.prepare(&format!("SELECT name,snap_id,kind,source,destination,ro_rw,date FROM (SELECT row_number() over(ORDER BY date DESC) n,* from snapshots WHERE name like '{}%' AND kind = '{}' AND ro_rw = '{}') WHERE n > {}", args.snapshot_prefix, args.snapshot_kind, args.snapshot_ro_rw, args.keep_only))?;
 
     while let State::Row = statement.next()? {
-        let mut db_struct = Database::default();
-
-        db_struct.name = statement.read::<String>(0).unwrap();
-        db_struct.snap_id = statement.read::<String>(1).unwrap();
-        db_struct.kind = statement.read::<String>(2).unwrap();
-        db_struct.source = statement.read::<String>(3).unwrap();
-        db_struct.destination = statement.read::<String>(4).unwrap();
-        db_struct.ro_rw = statement.read::<String>(5).unwrap();
-        db_struct.date = statement.read::<String>(6).unwrap();
-
-        snapshots_data.push(db_struct);
+        let db_struct = Database::default();
+        snapshots_data.push(populate_db_struct(&statement, db_struct)?);
     }
 
     Ok(snapshots_data)
+}
+
+fn populate_db_struct(row: &Statement, mut db_struct: Database) -> Result<Database> {
+    db_struct.name = row.read::<String>(0)?;
+    db_struct.snap_id = row.read::<String>(1)?;
+    db_struct.kind = row.read::<String>(2)?;
+    db_struct.source = row.read::<String>(3)?;
+    db_struct.destination = row.read::<String>(4)?;
+    db_struct.ro_rw = row.read::<String>(5)?;
+    db_struct.date = row.read::<String>(6)?;
+    Ok(db_struct)
 }
