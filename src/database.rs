@@ -50,7 +50,8 @@ pub fn return_snapshot_data(connection: &Connection, args: &Args) -> Result<Data
 pub fn return_all_data(connection: &Connection) -> Result<Vec<Database>> {
     let mut snapshots_data: Vec<Database> = Vec::new();
 
-    let mut statement = connection.prepare("SELECT * FROM snapshots ORDER BY date DESC")?;
+    let mut statement = connection
+        .prepare("SELECT name,snap_id,kind,source,destination,ro_rw,datetime(date, 'localtime') FROM snapshots ORDER BY date DESC")?;
 
     while let State::Row = statement.next()? {
         let db_struct = Database::default();
