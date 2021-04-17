@@ -3,6 +3,13 @@ use rusnapshot::{args, controller, database, errors::*};
 fn run() -> Result<()> {
     let mut arguments = args::get_args();
 
+    if !arguments.source_dir.ends_with('/') {
+        arguments.source_dir += "/"
+    }
+    if !arguments.dest_dir.ends_with('/') {
+        arguments.dest_dir += "/"
+    }
+
     database::setup_initial_database(&arguments.database_connection)?;
 
     if arguments.create_snapshot {
