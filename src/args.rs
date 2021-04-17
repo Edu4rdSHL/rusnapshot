@@ -28,10 +28,34 @@ pub fn get_args() -> Args {
         } else {
             return_value_or_default(&settings, "source_dir", String::new())
         },
-        database_file: if matches.is_present("database-file") {
-            value_t!(matches, "database-file", String).unwrap_or_else(|_| String::new())
-        } else {
-            return_value_or_default(&settings, "database_file", String::new())
+        database_connection: {
+            let db_file_path = if matches.is_present("database-file") {
+                value_t!(matches, "database-file", String).unwrap_or_else(|_| String::new())
+            } else {
+                return_value_or_default(&settings, "database_file", String::new())
+            };
+            if db_file_path.is_empty() {
+                eprintln!(
+                    "Please specify a database file with -d/--dfile or the database_file option in the config file, it's required for all the operations, leaving."
+                );
+                std::process::exit(1)
+            } else {
+                match sqlite::open(&db_file_path) {
+                    Ok(mut connection) => {
+                        connection
+                            .set_busy_timeout(5000)
+                            .expect("Failed to set database timeout");
+                        connection
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Error while trying to stablish the database connection. Error: {}",
+                            e
+                        );
+                        std::process::exit(1)
+                    }
+                }
+            }
         },
         snapshot_name: String::new(),
         snapshot_id: value_t!(matches, "snapshot-id", String).unwrap_or_else(|_| String::new()),

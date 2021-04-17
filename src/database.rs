@@ -6,13 +6,6 @@ use {
     sqlite::{Connection, State, Statement},
 };
 
-pub fn test_database(connection_str: &str) -> Result<()> {
-    let connection = sqlite::open(&connection_str)?;
-    drop(connection);
-
-    Ok(())
-}
-
 pub fn setup_initial_database(connection: &Connection) -> Result<()> {
     connection.execute("CREATE TABLE IF NOT EXISTS snapshots (name TEXT NOT NULL, snap_id TEXT NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, destination TEXT NOT NULL, ro_rw TEXT NOT NULL, date TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(name, snap_id))")?;
     connection.execute("PRAGMA journal_mode=WAL")?;

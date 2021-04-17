@@ -1,4 +1,5 @@
-#[derive(Clone, Debug)]
+use sqlite::Connection;
+
 pub struct Args {
     pub create_snapshot: bool,
     pub delete_snapshot: bool,
@@ -8,7 +9,7 @@ pub struct Args {
     pub rw_snapshots: bool,
     pub dest_dir: String,
     pub source_dir: String,
-    pub database_file: String,
+    pub database_connection: Connection,
     pub snapshot_name: String,
     pub snapshot_id: String,
     pub snapshot_prefix: String,
