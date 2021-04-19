@@ -1,0 +1,12 @@
+[Unit]
+Description=Snapshot root directory.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --cr --clean --kind three-hours
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --cr --clean --kind three-hours --rw
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --cr --clean --kind three-hours
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --cr --clean --kind three-hours --rw
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Take snapshots every 3 hours.
+
+[Timer]
+OnBootSec=1h
+OnUnitActiveSec=3h
+
+[Install]
+WantedBy=timers.target

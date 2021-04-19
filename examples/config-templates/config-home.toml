@@ -1,0 +1,5 @@
+dest_dir = "/mnt/defvol/_snapshots/"
+source_dir = "/home/"
+database_file = "/mnt/defvol/_snapshots/rustnapshot.sqlite"
+snapshot_prefix = "home"
+keep_only = "2"
