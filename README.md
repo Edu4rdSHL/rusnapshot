@@ -1,6 +1,10 @@
 # Description
 Simple and handy btrfs snapshoting tool. Supports unattended snapshots, tracking, restoring, automatic cleanup and more. Backed with SQLite.
 
+# Documentation
+
+See the [docs folder](https://github.com/Edu4rdSHL/rusnapshot/blob/master/docs/).
+
 # Features
 
 - Allows you to specify the origin and destination of snapshots at will of the user.
