@@ -3,6 +3,7 @@
 NAME="rusnapshot"
 
 LINUX_TARGET="x86_64-unknown-linux-musl"
+LINUX_X86_TARGET="i686-unknown-linux-musl"
 MANPAGE_DIR="./$NAME.1"
 
 # Linux build
@@ -14,6 +15,17 @@ if cargo build -q --release --target="$LINUX_TARGET"; then
   sha512sum "target/$LINUX_TARGET/release/$NAME-linux" >"target/$LINUX_TARGET/release/$NAME-linux.sha512"
 else
   echo "Linux artifact build: FAILED"
+fi
+
+# Linux x86 build
+echo "Building Linux x86 artifact."
+if cross build -q --release --target="$LINUX_X86_TARGET"; then
+  echo "Linux x86 artifact build: SUCCESS"
+  cp "target/$LINUX_X86_TARGET/release/$NAME" "target/$LINUX_X86_TARGET/release/$NAME-linux-i386"
+  strip "target/$LINUX_X86_TARGET/release/$NAME-linux-i386"
+  sha512sum "target/$LINUX_X86_TARGET/release/$NAME-linux-i386" >"target/$LINUX_X86_TARGET/release/$NAME-linux-i386.sha512"
+else
+  echo "Linux x86 artifact build: FAILED"
 fi
 
 echo "Creating manpage..."
