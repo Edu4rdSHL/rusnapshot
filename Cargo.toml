@@ -16,3 +16,11 @@ sqlite = "0.26.0"
 md5 = "0.7.0"
 chrono = "0.4.19"
 prettytable-rs = "0.8.0"
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+incremental = false
+opt-level = "s"
