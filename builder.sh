@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Rusolver releaser
 NAME="rusnapshot"
 
 LINUX_TARGET="x86_64-unknown-linux-musl"
 LINUX_X86_TARGET="i686-unknown-linux-musl"
 MANPAGE_DIR="./$NAME.1"
+
+if ! systemctl is-active docker >/dev/null 2>&1; then
+  echo "Docker is not running. Starting docker."
+  if ! sudo systemctl start docker; then
+    echo "Failed to start docker."
+    exit 1
+  fi
+fi
 
 # Linux build
 echo "Building Linux artifact."
@@ -39,18 +46,9 @@ else
   echo "Please install the help2man package."
 fi
 
-if command -v git >/dev/null; then
-  git add .
-  git commit -m "Bump version."
-  git push
+# Stop docker
+echo "Stopping docker."
+if ! sudo systemctl stop docker; then
+  echo "Failed to stop docker."
+  exit 1
 fi
-
-#echo "Uploading crate to crates.io..."
-#if cargo publish --no-verify > /dev/null; then
-#  echo "Crate uploaded."
-#else
-#  echo "An error has occurred while uploading the crate to crates.io."
-#  exit
-#fi
-
-echo "All builds have passed!"
