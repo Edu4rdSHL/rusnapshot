@@ -18,7 +18,7 @@ pub fn commit_to_database(connection: &Connection, args: &Args) -> Result<()> {
         "INSERT INTO snapshots (name, snap_id, kind, source, destination, ro_rw) VALUES ('{}', '{}', '{}', '{}', '{}', '{}')",
         args.snapshot_name, args.snapshot_id, args.snapshot_kind, args.source_dir, args.dest_dir, args.snapshot_ro_rw
     );
-    connection.execute(&statement)?;
+    connection.execute(statement)?;
 
     Ok(())
 }
@@ -28,7 +28,7 @@ pub fn delete_from_database(connection: &Connection, args: &Args) -> Result<()> 
         "DELETE FROM snapshots WHERE name = '{}' OR snap_id = '{}'",
         args.snapshot_id, args.snapshot_id
     );
-    connection.execute(&statement)?;
+    connection.execute(statement)?;
 
     Ok(())
 }
