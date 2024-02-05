@@ -15,7 +15,7 @@ pub struct Args {
     #[clap(short = 'c', long = "config")]
     pub config_file: Option<String>,
     /// Directory where snapshots should be saved.
-    #[clap(long = "to", requires_all = &["create_snapshot"], default_value = "/.rusnapshot")]
+    #[clap(long = "to", requires_all = &["create_snapshot"], default_value = "")]
     pub dest_dir: String,
     /// Directory from where snapshots should be created. It can also be used to specify the directory where a snapshot will be restored.
     #[clap(long = "from", requires_all = &["create_snapshot"], default_value = "")]
@@ -47,7 +47,8 @@ pub struct Args {
     #[clap(long = "create", conflicts_with_all = &["restore_snapshot", "delete_snapshot", "list_snapshots", "clean_snapshots"])]
     pub create_snapshot: bool,
     /// Enable snapshots cleaning, will keep only the last X snapshots specified with -k/--keep.
-    #[clap(long = "clean", requires_all = &["keep_only", "snapshot_kind", "snapshot_prefix"])]
+    /// This option requires: -k/--keep, -p/--prefix and --kind via command line or configuration file.
+    #[clap(long = "clean")]
     pub clean_snapshots: bool,
     /// Delete a snapshot.
     #[clap(long = "del", requires_all = &["snapshot_id"])]
@@ -95,35 +96,60 @@ impl Args {
 
         Ok(())
     }
-}
 
-// Deserialize the configuration file.
-impl Args {
+    pub fn check_for_source_and_dest_dir(&mut self) {
+        if self.source_dir.is_empty() || self.dest_dir.is_empty() {
+            eprintln!("Specify both source and destination directories before taking a snapshot.");
+            std::process::exit(1);
+        }
+    }
+
     /// Deserialize the configuration file.
     pub fn from_config_file(&mut self) -> Result<()> {
         let config_file = std::fs::read_to_string(self.config_file.as_deref().unwrap())?;
         let config: BTreeMap<String, toml::Value> = toml::from_str(&config_file)?;
 
         if let Some(dest_dir) = config.get("dest_dir") {
-            self.dest_dir = dest_dir.as_str().unwrap().to_string();
+            self.dest_dir = dest_dir
+                .as_str()
+                .expect("Failed to parse dest_dir")
+                .to_string();
         }
         if let Some(source_dir) = config.get("source_dir") {
-            self.source_dir = source_dir.as_str().unwrap().to_string();
+            self.source_dir = source_dir
+                .as_str()
+                .expect("Failed to parse source_dir")
+                .to_string();
         }
         if let Some(snapshot_prefix) = config.get("snapshot_prefix") {
-            self.snapshot_prefix = snapshot_prefix.as_str().unwrap().to_string();
+            self.snapshot_prefix = snapshot_prefix
+                .as_str()
+                .expect("Failed to parse snapshot_prefix")
+                .to_string();
         }
         if let Some(snapshot_kind) = config.get("snapshot_kind") {
-            self.snapshot_kind = snapshot_kind.as_str().unwrap().to_string();
+            self.snapshot_kind = snapshot_kind
+                .as_str()
+                .expect("Failed to parse snapshot_kind")
+                .to_string();
         }
         if let Some(database_file) = config.get("database_file") {
-            self.database_file = database_file.as_str().unwrap().to_string();
+            self.database_file = database_file
+                .as_str()
+                .expect("Failed to parse database_file")
+                .to_string();
         }
         if let Some(keep_only) = config.get("keep_only") {
-            self.keep_only = keep_only.as_integer().unwrap() as usize;
+            self.keep_only = keep_only
+                .to_string()
+                .parse()
+                .expect("Failed to parse keep_only, make sure it's a number");
         }
         if let Some(timeout) = config.get("timeout") {
-            self.timeout = timeout.as_integer().unwrap() as usize;
+            self.timeout = timeout
+                .to_string()
+                .parse()
+                .expect("Failed to parse timeout, make sure it's a number");
         }
 
         Ok(())
