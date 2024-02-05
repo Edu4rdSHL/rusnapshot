@@ -1,6 +1,6 @@
 [package]
 name = "rusnapshot"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["edu4rdshl"]
 edition = "2018"
 description = "Simple and handy btrfs snapshoting tool."
