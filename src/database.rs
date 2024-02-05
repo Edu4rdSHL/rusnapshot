@@ -1,8 +1,9 @@
 use {
     crate::{
-        errors::*,
-        structs::{Args, Database},
+        args::Args,
+        structs::{Database, ExtraArgs},
     },
+    anyhow::Result,
     sqlite::{Connection, State, Statement},
 };
 
@@ -13,12 +14,12 @@ pub fn setup_initial_database(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub fn commit_to_database(connection: &Connection, args: &Args) -> Result<()> {
+pub fn commit_to_database(args: &Args, extra_args: &ExtraArgs) -> Result<()> {
     let statement = format!(
         "INSERT INTO snapshots (name, snap_id, kind, source, destination, ro_rw) VALUES ('{}', '{}', '{}', '{}', '{}', '{}')",
-        args.snapshot_name, args.snapshot_id, args.snapshot_kind, args.source_dir, args.dest_dir, args.snapshot_ro_rw
+        &extra_args.snapshot_name, args.snapshot_id, args.snapshot_kind, args.source_dir, args.dest_dir, args.read_write
     );
-    connection.execute(statement)?;
+    extra_args.database_connection.execute(statement)?;
 
     Ok(())
 }
@@ -40,7 +41,7 @@ pub fn return_snapshot_data(connection: &Connection, args: &Args) -> Result<Data
     ))?;
     let mut snap_data = Database::default();
 
-    while let State::Row = statement.next()? {
+    while statement.next()? == State::Row {
         snap_data = populate_db_struct(&statement, snap_data)?;
     }
 
@@ -53,7 +54,7 @@ pub fn return_all_data(connection: &Connection) -> Result<Vec<Database>> {
     let mut statement = connection
         .prepare("SELECT name,snap_id,kind,source,destination,ro_rw,datetime(date, 'localtime') FROM snapshots ORDER BY date DESC")?;
 
-    while let State::Row = statement.next()? {
+    while statement.next()? == State::Row {
         let db_struct = Database::default();
         snapshots_data.push(populate_db_struct(&statement, db_struct)?);
     }
@@ -64,9 +65,9 @@ pub fn return_all_data(connection: &Connection) -> Result<Vec<Database>> {
 pub fn return_only_x_items(connection: &Connection, args: &Args) -> Result<Vec<Database>> {
     let mut snapshots_data: Vec<Database> = Vec::new();
 
-    let mut statement = connection.prepare(&format!("SELECT name,snap_id,kind,source,destination,ro_rw,date FROM (SELECT row_number() over(ORDER BY date DESC) n,* from snapshots WHERE name like '{}%' AND kind = '{}' AND ro_rw = '{}') WHERE n > {}", args.snapshot_prefix, args.snapshot_kind, args.snapshot_ro_rw, args.keep_only))?;
+    let mut statement = connection.prepare(&format!("SELECT name,snap_id,kind,source,destination,ro_rw,date FROM (SELECT row_number() over(ORDER BY date DESC) n,* from snapshots WHERE name like '{}%' AND kind = '{}' AND ro_rw = '{}') WHERE n > {}", args.snapshot_prefix, args.snapshot_kind, args.read_write, args.keep_only))?;
 
-    while let State::Row = statement.next()? {
+    while statement.next()? == State::Row {
         let db_struct = Database::default();
         snapshots_data.push(populate_db_struct(&statement, db_struct)?);
     }
@@ -75,12 +76,15 @@ pub fn return_only_x_items(connection: &Connection, args: &Args) -> Result<Vec<D
 }
 
 fn populate_db_struct(row: &Statement, mut db_struct: Database) -> Result<Database> {
-    db_struct.name = row.read::<String>(0)?;
-    db_struct.snap_id = row.read::<String>(1)?;
-    db_struct.kind = row.read::<String>(2)?;
-    db_struct.source = row.read::<String>(3)?;
-    db_struct.destination = row.read::<String>(4)?;
-    db_struct.ro_rw = row.read::<String>(5)?;
-    db_struct.date = row.read::<String>(6)?;
+    // I'll improve this later.
+
+    db_struct.name = row.read(0)?;
+    db_struct.snap_id = row.read(1)?;
+    db_struct.kind = row.read(2)?;
+    db_struct.source = row.read(3)?;
+    db_struct.destination = row.read(4)?;
+    db_struct.ro_rw = row.read(5)?;
+    db_struct.date = row.read(6)?;
+
     Ok(db_struct)
 }

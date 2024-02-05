@@ -1,155 +1,97 @@
 use {
-    crate::structs::Args,
-    clap::{load_yaml, value_t, App},
-    std::{collections::HashMap, path::Path},
+    crate::{database, operations, structs::ExtraArgs},
+    anyhow::Result,
+    clap::Parser,
+    serde::{Deserialize, Serialize},
+    sqlite::Connection,
 };
 
-pub fn get_args() -> Args {
-    let yaml = load_yaml!("cli.yml");
-    let matches = App::from_yaml(yaml)
-        .version(clap::crate_version!())
-        .get_matches();
-    let settings: HashMap<String, String> =
-        return_settings(&matches, &mut config::Config::default());
-    Args {
-        create_snapshot: matches.is_present("create-snapshot"),
-        delete_snapshot: matches.is_present("delete-snapshot"),
-        list_snapshots: matches.is_present("list-snapshots"),
-        clean_snapshots: matches.is_present("clean-snapshots") || matches.is_present("keep-only"),
-        restore_snapshot: matches.is_present("restore-snapshot"),
-        rw_snapshots: matches.is_present("read-write"),
-        dest_dir: if matches.is_present("dest-dir") {
-            value_t!(matches, "dest-dir", String).unwrap_or_else(|_| String::new())
-        } else {
-            return_value_or_default(&settings, "dest_dir", String::new())
-        },
-        source_dir: if matches.is_present("source-dir") {
-            value_t!(matches, "source-dir", String).unwrap_or_else(|_| String::new())
-        } else {
-            return_value_or_default(&settings, "source_dir", String::new())
-        },
-        database_connection: {
-            let db_file_path = if matches.is_present("database-file") {
-                value_t!(matches, "database-file", String).unwrap_or_else(|_| String::new())
-            } else {
-                return_value_or_default(&settings, "database_file", String::new())
-            };
-            if db_file_path.is_empty() {
-                eprintln!(
-                    "Please specify a database file with -d/--dfile or the database_file option in the config file, it's required for all the operations, leaving."
-                );
-                std::process::exit(1)
-            } else {
-                match sqlite::open(&db_file_path) {
-                    Ok(mut connection) => {
-                        let timeout = value_t!(matches, "timeout", usize).unwrap_or_else(|_| 5000);
-                        connection
-                            .set_busy_timeout(timeout)
-                            .expect("Failed to set database timeout");
-                        connection
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Error while trying to stablish the database connection. Error: {}",
-                            e
-                        );
-                        std::process::exit(1)
-                    }
-                }
-            }
-        },
-        snapshot_name: String::new(),
-        snapshot_id: value_t!(matches, "snapshot-id", String).unwrap_or_else(|_| String::new()),
-        snapshot_prefix: if matches.is_present("snapshot-prefix") {
-            value_t!(matches, "snapshot-prefix", String)
-                .unwrap_or_else(|_| String::from("snapshot"))
-        } else {
-            return_value_or_default(&settings, "snapshot_prefix", String::from("snapshot"))
-        },
-        snapshot_kind: if matches.is_present("snapshot-kind") {
-            value_t!(matches, "snapshot-kind", String)
-                .unwrap_or_else(|_| String::from("rusnapshot"))
-        } else {
-            return_value_or_default(&settings, "snapshot_kind", String::from("rusnapshot"))
-        },
-        snapshot_ro_rw: if matches.is_present("read-write") {
-            "read-write".to_string()
-        } else {
-            "read-only".to_string()
-        },
-        keep_only: if matches.is_present("keep-only") {
-            value_t!(matches, "keep-only", usize).unwrap_or_else(|_| 0)
-        } else {
-            return_value_or_default(&settings, "keep_only", 0.to_string())
-                .parse()
-                .unwrap_or_default()
-        },
-    }
+/// Simple and handy btrfs snapshoting tool.
+#[derive(Parser, Debug, Default, Serialize, Deserialize, Clone)]
+#[clap(author, version, about, long_about = None, arg_required_else_help = true)]
+pub struct Args {
+    /// Path to configuration file.
+    #[clap(short = 'c', long = "config")]
+    pub config_file: Option<String>,
+    /// Directory where snapshots should be saved.
+    #[clap(long = "to", requires_all = &["create_snapshot"], default_value = "/.rusnapshot")]
+    pub dest_dir: String,
+    /// Directory from where snapshots should be created. It can also be used to specify the directory where a snapshot will be restored.
+    #[clap(long = "from", requires_all = &["create_snapshot"], default_value = "")]
+    pub source_dir: String,
+    /// Snapshot id or name to work with.
+    #[clap(long = "id", default_value = "")]
+    pub snapshot_id: String,
+    /// Path to the SQLite database file.
+    #[clap(
+        short = 'd',
+        long = "dfile",
+        env = "RUSNAPSHOT_DB_FILE",
+        default_value = "/var/lib/rusnapshot/rusnapshot.db"
+    )]
+    pub database_file: String,
+    /// Prefix for the snapshot name.
+    #[clap(short = 'p', long = "prefix", default_value = "rusnapshot")]
+    pub snapshot_prefix: String,
+    /// Used to specify a differentiator between snapshots with the same prefix.
+    #[clap(long = "kind", default_value = "rusnapshot")]
+    pub snapshot_kind: String,
+    /// Keep only the last X items.
+    #[clap(short = 'k', long = "keep", default_value = "10")]
+    pub keep_only: usize,
+    /// Time in milliseconds until SQLite can return a timeout. Do not touch if you don't know what you are doing.
+    #[clap(long = "timeout", default_value = "5000")]
+    pub timeout: usize,
+    /// Create a read-only/ro snapshot.
+    #[clap(long = "create", conflicts_with_all = &["restore_snapshot", "delete_snapshot", "list_snapshots", "clean_snapshots"])]
+    pub create_snapshot: bool,
+    /// Enable snapshots cleaning, will keep only the last X snapshots specified with -k/--keep.
+    #[clap(long = "clean")]
+    pub clean_snapshots: bool,
+    /// Delete a snapshot.
+    #[clap(long = "del", requires_all = &["snapshot_id"])]
+    pub delete_snapshot: bool,
+    /// Restore a specific snapshot.
+    #[clap(short = 'r', long = "restore", requires_all = &["snapshot_id"])]
+    pub restore_snapshot: bool,
+    /// List the snapshots tracked in the database.
+    #[clap(short = 'l', long = "list")]
+    pub list_snapshots: bool,
+    /// Create read-write/rw snapshots.
+    #[clap(short = 'w', long = "rw")]
+    pub read_write: bool,
+    /// Init the Rusnapshot database and directory structure.
+    #[clap(long = "init")]
+    pub init: bool,
 }
 
-fn return_settings(
-    matches: &clap::ArgMatches,
-    settings: &mut config::Config,
-) -> HashMap<String, String> {
-    if matches.is_present("config-file") {
-        match settings.merge(config::File::with_name(
-            &value_t!(matches, "config-file", String).unwrap(),
-        )) {
-            Ok(settings) => match settings.merge(config::Environment::with_prefix("RUSNAPSHOT")) {
-                Ok(settings) => settings
-                    .clone()
-                    .try_into::<HashMap<String, String>>()
-                    .unwrap(),
-                Err(e) => {
-                    eprintln!("Error merging environment variables into settings: {}", e);
-                    std::process::exit(1)
-                }
-            },
-            Err(e) => {
-                eprintln!("Error reading config file: {}", e);
-                std::process::exit(1)
+impl Args {
+    /// Get the database connection string.
+    #[must_use]
+    pub fn database_connection(&self) -> Connection {
+        match sqlite::open(&self.database_file) {
+            Ok(mut connection) => {
+                connection
+                    .set_busy_timeout(self.timeout)
+                    .expect("Failed to set database timeout");
+
+                connection
             }
-        }
-    } else if Path::new("rusnapshot.toml").exists()
-        || Path::new("rusnapshot.json").exists()
-        || Path::new("rusnapshot.hjson").exists()
-        || Path::new("rusnapshot.ini").exists()
-        || Path::new("rusnapshot.yml").exists()
-    {
-        match settings.merge(config::File::with_name("rusnapshot")) {
-            Ok(settings) => match settings.merge(config::Environment::with_prefix("RUSNAPSHOT")) {
-                Ok(settings) => settings
-                    .clone()
-                    .try_into::<HashMap<String, String>>()
-                    .unwrap(),
-                Err(e) => {
-                    eprintln!("Error merging environment variables into settings: {}", e);
-                    std::process::exit(1)
-                }
-            },
             Err(e) => {
-                eprintln!("Error reading config file: {}", e);
-                std::process::exit(1)
-            }
-        }
-    } else {
-        match settings.merge(config::Environment::with_prefix("RUSNAPSHOT")) {
-            Ok(settings) => settings
-                .clone()
-                .try_into::<HashMap<String, String>>()
-                .unwrap(),
-            Err(e) => {
-                eprintln!("Error merging environment variables into settings: {}", e);
+                eprintln!("Error while trying to stablish the database connection. Error: {e}");
                 std::process::exit(1)
             }
         }
     }
-}
 
-fn return_value_or_default(
-    settings: &HashMap<String, String>,
-    value: &str,
-    default_value: String,
-) -> String {
-    settings.get(value).unwrap_or(&default_value).to_string()
+    /// Initialize the database and directory structure.
+    pub fn init(&self, extra_args: &ExtraArgs) -> Result<()> {
+        if !std::path::Path::new(&self.dest_dir).exists() {
+            println!("Setting up the directory structure.");
+            operations::setup_directory_structure(self)?;
+        }
+        database::setup_initial_database(&extra_args.database_connection)?;
+
+        Ok(())
+    }
 }
