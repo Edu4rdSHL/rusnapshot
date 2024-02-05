@@ -1,12 +1,13 @@
-use crate::utils::is_same_character;
-use std::path::PathBuf;
-
 use {
-    crate::args::Args,
+    crate::{args::Args, utils::is_same_character},
     anyhow::Result,
-    std::{path::Path, process::Command},
+    std::{
+        path::{Path, PathBuf},
+        process::Command,
+    },
 };
 
+#[must_use]
 pub fn take_snapshot(args: &Args, snapshot_name: &str) -> bool {
     let snapshot_name = format!("{}/{}", args.dest_dir, snapshot_name);
     let mut btrfs_args = vec!["subvolume", "snapshot", &args.source_dir, &snapshot_name];
@@ -20,12 +21,12 @@ pub fn take_snapshot(args: &Args, snapshot_name: &str) -> bool {
         .success()
 }
 
+#[must_use]
 pub fn del_snapshot(snapshot_name: &str) -> bool {
     // Refuse to delete the root subvolume.
     if snapshot_name == "/" || is_same_character(snapshot_name, '/') {
         println!(
-            "Snapshot name to delete is: {}. Refusing to delete the root subvolume.",
-            snapshot_name
+            "Snapshot name to delete is: {snapshot_name}. Refusing to delete the root subvolume."
         );
         std::process::exit(1);
     }
@@ -36,6 +37,7 @@ pub fn del_snapshot(snapshot_name: &str) -> bool {
         .success()
 }
 
+#[must_use]
 pub fn restore_snapshot(args: &Args, snapshot_name: &str) -> bool {
     !Path::new(&args.dest_dir).exists()
         && Command::new("btrfs")
