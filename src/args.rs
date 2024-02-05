@@ -62,9 +62,6 @@ pub struct Args {
     /// Create read-write/rw snapshots.
     #[clap(short = 'w', long = "rw")]
     pub read_write: bool,
-    /// Init the Rusnapshot database and directory structure.
-    #[clap(long = "init")]
-    pub init: bool,
 }
 
 impl Args {
