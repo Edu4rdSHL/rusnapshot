@@ -43,21 +43,20 @@ pub fn manage_restoring(args: &mut Args, extra_args: &mut ExtraArgs) -> Result<(
         std::process::exit(1);
     } else {
         extra_args.snapshot_name = snapshot_data.destination + &snapshot_data.name;
-        if args.source_dir.is_empty() {
-            args.source_dir = snapshot_data.source;
+        if args.dest_dir.is_empty() {
+            // The current destination directory corresponds to the source directory
+            // at the moment of the snapshot creation.
+            args.dest_dir = snapshot_data.source;
         }
     }
     println!("Restoring the snapshot with ID {}", args.snapshot_id);
     println!("Name of the snapshot: {}", extra_args.snapshot_name);
-    println!("Source directory: {}", args.source_dir);
+    println!("Restoring snapshot to: {}", args.dest_dir);
 
     if !extra_args.snapshot_name.is_empty()
         && operations::restore_snapshot(args, &extra_args.snapshot_name)
     {
-        println!(
-            "The snapshot with ID {} was successfully restored to {}",
-            args.snapshot_id, args.source_dir
-        );
+        println!("The snapshot was successfully restored");
     }
 
     Ok(())
