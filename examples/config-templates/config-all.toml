@@ -12,4 +12,4 @@ snapshot_prefix = "root"
 # Snapshots identifier
 snapshot_kind = "weekly"
 # Last snapshots to keep. If prefix is specified then only the snapshots with that prefix will be deleted
-keep_only = "2"
+keep_only = 2

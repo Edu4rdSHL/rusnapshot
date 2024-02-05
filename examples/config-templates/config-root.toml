@@ -7,4 +7,4 @@ database_file = "/var/lib/rusnapshot/rusnapshot.db"
 # Prefix for the snapshots, they will be saved in the format prefix-$current_date
 snapshot_prefix = "root"
 # Last snapshots to keep. If prefix is specified then only the snapshots with that prefix will be deleted
-keep_only = "2"
+keep_only = 2
