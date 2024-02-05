@@ -1,12 +1,12 @@
-# Example configuration file for rustnapshot
+# Example configuration file for rusnapshot
 # These are all the current available options
 
 # Snapshots directory
 dest_dir = "/mnt/defvol/_snapshots/"
-# Directory to be snapshoted
+# Directory to be snapshot-ed
 source_dir = "/mnt/defvol/_active/root/"
 # SQLite database file PATH, created if no exists, recommended to be in the snapshots dir
-database_file = "/mnt/defvol/_snapshots/rustnapshot.sqlite"
+database_file = "/mnt/defvol/_snapshots/rusnapshot.sqlite"
 # Prefix for the snapshots, they will be saved in the format prefix-$current_date
 snapshot_prefix = "root"
 # Snapshots identifier

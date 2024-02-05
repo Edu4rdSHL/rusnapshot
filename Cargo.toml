@@ -15,6 +15,7 @@ md5 = "0.7.0"
 chrono = "0.4.33"
 prettytable-rs = "0.10.0"
 anyhow = "1.0.79"
+toml = "0.8.9"
 
 
 [profile.release]

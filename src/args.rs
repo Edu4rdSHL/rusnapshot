@@ -4,6 +4,7 @@ use {
     clap::Parser,
     serde::{Deserialize, Serialize},
     sqlite::Connection,
+    std::collections::BTreeMap,
 };
 
 /// Simple and handy btrfs snapshoting tool.
@@ -46,7 +47,7 @@ pub struct Args {
     #[clap(long = "create", conflicts_with_all = &["restore_snapshot", "delete_snapshot", "list_snapshots", "clean_snapshots"])]
     pub create_snapshot: bool,
     /// Enable snapshots cleaning, will keep only the last X snapshots specified with -k/--keep.
-    #[clap(long = "clean")]
+    #[clap(long = "clean", requires_all = &["keep_only", "snapshot_kind", "snapshot_prefix"])]
     pub clean_snapshots: bool,
     /// Delete a snapshot.
     #[clap(long = "del", requires_all = &["snapshot_id"])]
@@ -91,6 +92,39 @@ impl Args {
             operations::setup_directory_structure(self)?;
         }
         database::setup_initial_database(&extra_args.database_connection)?;
+
+        Ok(())
+    }
+}
+
+// Deserialize the configuration file.
+impl Args {
+    /// Deserialize the configuration file.
+    pub fn from_config_file(&mut self) -> Result<()> {
+        let config_file = std::fs::read_to_string(self.config_file.as_deref().unwrap())?;
+        let config: BTreeMap<String, toml::Value> = toml::from_str(&config_file)?;
+
+        if let Some(dest_dir) = config.get("dest_dir") {
+            self.dest_dir = dest_dir.as_str().unwrap().to_string();
+        }
+        if let Some(source_dir) = config.get("source_dir") {
+            self.source_dir = source_dir.as_str().unwrap().to_string();
+        }
+        if let Some(snapshot_prefix) = config.get("snapshot_prefix") {
+            self.snapshot_prefix = snapshot_prefix.as_str().unwrap().to_string();
+        }
+        if let Some(snapshot_kind) = config.get("snapshot_kind") {
+            self.snapshot_kind = snapshot_kind.as_str().unwrap().to_string();
+        }
+        if let Some(database_file) = config.get("database_file") {
+            self.database_file = database_file.as_str().unwrap().to_string();
+        }
+        if let Some(keep_only) = config.get("keep_only") {
+            self.keep_only = keep_only.as_integer().unwrap() as usize;
+        }
+        if let Some(timeout) = config.get("timeout") {
+            self.timeout = timeout.as_integer().unwrap() as usize;
+        }
 
         Ok(())
     }

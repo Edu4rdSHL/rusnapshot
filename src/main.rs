@@ -8,6 +8,10 @@ use rusnapshot::{args, controller, structs::ExtraArgs};
 fn try_run() -> Result<()> {
     let mut arguments = args::Args::parse();
 
+    if arguments.config_file.is_some() {
+        arguments.from_config_file()?;
+    }
+
     let mut extra_args = ExtraArgs {
         snapshot_name: format!(
             "{}-{}",
@@ -19,19 +23,19 @@ fn try_run() -> Result<()> {
 
     arguments.init(&extra_args)?;
 
-    // It's required to have a trailing slash for the source and destination directories.
-    // Otherwise, when we retrieve the snapshot data from the database, we won't be able to
-    // restore/delete the snapshot because the source/destination paths won't match.
-    if !arguments.source_dir.is_empty() && !arguments.source_dir.ends_with('/') {
-        arguments.source_dir += "/";
-    }
-    if !arguments.dest_dir.is_empty() && !arguments.dest_dir.ends_with('/') {
-        arguments.dest_dir += "/";
-    }
-
-    // Now we need to make sure that the paths for source and destination are full paths.
-    // If they are not, we will use the current working directory to build the full path.
     if arguments.create_snapshot {
+        // It's required to have a trailing slash for the source and destination directories.
+        // Otherwise, when we retrieve the snapshot data from the database, we won't be able to
+        // restore/delete the snapshot because the source/destination paths won't match.
+        if !arguments.source_dir.is_empty() && !arguments.source_dir.ends_with('/') {
+            arguments.source_dir += "/";
+        }
+        if !arguments.dest_dir.is_empty() && !arguments.dest_dir.ends_with('/') {
+            arguments.dest_dir += "/";
+        }
+
+        // Now we need to make sure that the paths for source and destination are full paths.
+        // If they are not, we will use the current working directory to build the full path.
         if !Path::new(&arguments.source_dir).is_absolute() {
             arguments.source_dir = std::env::current_dir()?
                 .join(&arguments.source_dir)

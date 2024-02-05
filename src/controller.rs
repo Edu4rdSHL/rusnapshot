@@ -95,9 +95,11 @@ pub fn manage_listing(database_connection: &Connection) -> Result<()> {
 
 pub fn keep_only_x(args: &mut Args, extra_args: &mut ExtraArgs) -> Result<()> {
     let snaps_data = database::return_only_x_items(&extra_args.database_connection, args)?;
+
     for data in &snaps_data {
         extra_args.snapshot_name = data.destination.clone() + &data.name;
         args.snapshot_id = data.snap_id.clone();
+
         manage_deletion(args, extra_args)?;
     }
 
