@@ -21,9 +21,11 @@ fn try_run() -> Result<()> {
         database_connection: arguments.database_connection(),
     };
 
-    arguments.init(&extra_args)?;
-
     if arguments.create_snapshot {
+        arguments.check_for_source_and_dest_dir();
+
+        arguments.init(&extra_args)?;
+
         // It's required to have a trailing slash for the source and destination directories.
         // Otherwise, when we retrieve the snapshot data from the database, we won't be able to
         // restore/delete the snapshot because the source/destination paths won't match.
@@ -34,7 +36,7 @@ fn try_run() -> Result<()> {
             arguments.dest_dir += "/";
         }
 
-        // Now we need to make sure that the paths for source and destination are full paths.
+        // We need to make sure that the paths for source and destination are full paths.
         // If they are not, we will use the current working directory to build the full path.
         if !Path::new(&arguments.source_dir).is_absolute() {
             arguments.source_dir = std::env::current_dir()?

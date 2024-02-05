@@ -49,14 +49,17 @@ pub fn manage_restoring(args: &mut Args, extra_args: &mut ExtraArgs) -> Result<(
             args.dest_dir = snapshot_data.source;
         }
     }
-    println!("Restoring the snapshot with ID {}", args.snapshot_id);
-    println!("Name of the snapshot: {}", extra_args.snapshot_name);
-    println!("Restoring snapshot to: {}", args.dest_dir);
+    println!(
+        "Restoring snapshot {} to {}",
+        extra_args.snapshot_name, args.dest_dir
+    );
 
     if !extra_args.snapshot_name.is_empty()
         && operations::restore_snapshot(args, &extra_args.snapshot_name)
     {
         println!("The snapshot was successfully restored");
+    } else {
+        eprintln!("Error while restoring the snapshot");
     }
 
     Ok(())
