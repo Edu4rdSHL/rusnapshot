@@ -10,11 +10,11 @@ See the [docs folder](https://github.com/Edu4rdSHL/rusnapshot/blob/master/docs/)
 - Allows you to specify the origin and destination of snapshots at will of the user.
 - Track snapshots using SQLite as backend database.
 - Easy setup using small templates instead of confusing long files.
-- You can create snapshots of the volumes you want simply by using different configuration templates.
-- You can create read-only or read-write snapshots.
-- You can use the same SQLite database for everything.
-- You can specify the prefix of the name for the snapshots.
-- You can specify a `kind` identifier to differentiate them in the database. Useful if you plan to have hourly, weekly, montly or more "kind" of snapshots of the same subvolume(s).
+- Ability to create snapshots of the volumes you want simply by using different configuration templates.
+- Ability to create read-only or read-write snapshots.
+- Ability to use the same SQLite database for everything.
+- Ability to specify the prefix of the name for the snapshots for better identification.
+- Ability to specify a `kind` identifier to differentiate them in the database. Useful if you plan to have hourly, weekly, monthly or more "kind" of snapshots of the same subvolume(s).
 - Supports restoration of snapshots in the original directory or a specific one.
 - Automatic snapshots cleanup.
 - Nice CLI output to see the status and details of snapshots.
