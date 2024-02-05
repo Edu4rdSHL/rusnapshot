@@ -1,5 +1,10 @@
-dest_dir = "/mnt/defvol/_snapshots/"
-source_dir = "/home/"
-database_file = "/mnt/defvol/_snapshots/rusnapshot.sqlite"
+# Snapshots directory
+dest_dir = "/.rusnapshot"
+# Directory to be snapshot-ed
+source_dir = "/home"
+# SQLite database file PATH where snapshots metadata will be stored. Created if not exists
+database_file = "/var/lib/rusnapshot/rusnapshot.db"
+# Prefix for the snapshots, they will be saved in the format prefix-$current_date
 snapshot_prefix = "home"
+# Last snapshots to keep. If prefix is specified then only the snapshots with that prefix will be deleted
 keep_only = "2"
