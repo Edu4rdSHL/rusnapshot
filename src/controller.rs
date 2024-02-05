@@ -10,6 +10,8 @@ pub fn manage_creation(args: &mut Args, extra_args: &ExtraArgs) -> Result<()> {
     args.snapshot_id = format!("{:?}", md5::compute(&extra_args.snapshot_name));
     if operations::take_snapshot(args, &extra_args.snapshot_name) {
         database::commit_to_database(args, extra_args)?;
+    } else {
+        eprintln!("Error while taking the snapshot");
     }
 
     Ok(())
@@ -28,6 +30,8 @@ pub fn manage_deletion(args: &Args, extra_args: &mut ExtraArgs) -> Result<()> {
     }
     if !extra_args.snapshot_name.is_empty() && operations::del_snapshot(&extra_args.snapshot_name) {
         database::delete_from_database(&extra_args.database_connection, args)?;
+    } else {
+        eprintln!("Error while deleting the snapshot");
     }
 
     Ok(())
