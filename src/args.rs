@@ -28,7 +28,7 @@ pub struct Args {
         short = 'd',
         long = "dfile",
         env = "RUSNAPSHOT_DB_FILE",
-        default_value = "/var/lib/rusnapshot/rusnapshot.db"
+        default_value = "/.rusnapshot/rusnapshot.db"
     )]
     pub database_file: String,
     /// Prefix for the snapshot name.
