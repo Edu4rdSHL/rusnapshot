@@ -42,5 +42,9 @@ pub fn check_creation_requirements(arguments: &mut Args, extra_args: &ExtraArgs)
             .to_string();
     }
 
+    if arguments.machine.is_empty() {
+        arguments.machine = hostname::get()?.to_string_lossy().to_string();
+    }
+
     Ok(())
 }

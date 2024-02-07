@@ -1,7 +1,9 @@
-use anyhow::Result;
-use chrono::Utc;
-use clap::Parser;
-use rusnapshot::{args, controller, structs::ExtraArgs, utils};
+use {
+    anyhow::Result,
+    chrono::Utc,
+    clap::Parser,
+    rusnapshot::{args, controller, structs::ExtraArgs, utils},
+};
 
 fn try_run() -> Result<()> {
     let mut arguments = args::Args::parse();

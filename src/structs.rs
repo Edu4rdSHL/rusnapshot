@@ -8,6 +8,7 @@ pub struct Database {
     pub source: String,
     pub destination: String,
     pub ro_rw: String,
+    pub machine: String,
     pub date: String,
 }
 

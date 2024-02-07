@@ -62,6 +62,9 @@ pub struct Args {
     /// Create read-write/rw snapshots.
     #[clap(short = 'w', long = "rw")]
     pub read_write: bool,
+    /// Machine name to be used in the metadata.
+    #[clap(short, long, default_value = "")]
+    pub machine: String,
 }
 
 impl Args {
@@ -147,6 +150,12 @@ impl Args {
                 .to_string()
                 .parse()
                 .expect("Failed to parse timeout, make sure it's a number");
+        }
+        if let Some(machine) = config.get("machine") {
+            self.machine = machine
+                .to_string()
+                .parse()
+                .expect("Failed to parse machine");
         }
 
         Ok(())
