@@ -14,7 +14,7 @@
 
 - Create a snapshot using a [config file](https://github.com/Edu4rdSHL/rusnapshot/tree/master/examples/config-templates):
 
-`sudo rusnapshot --config {{path/to/config.toml}} --cr`
+`sudo rusnapshot --config {{path/to/config.toml}} --create`
 
 - List created snapshots:
 
@@ -30,11 +30,11 @@
 
 - Create a read-write snapshot:
 
-`sudo rusnapshot -c {{path/to/config.toml}} --cr --rw`
+`sudo rusnapshot -c {{path/to/config.toml}} --create --rw`
 
 - Restore a snapshot:
 
-`sudo rusnapshot -c {{path/to/config.toml}} --id {{snapshot_id}} --restore`
+`sudo rusnapshot --id {{snapshot_id}} --restore`
 
 # Notes
 
