@@ -8,3 +8,5 @@ database_file = "/.rusnapshot/rusnapshot.db"
 snapshot_prefix = "root"
 # Last snapshots to keep. If prefix is specified then only the snapshots with that prefix will be deleted
 keep_only = 2
+# Machine name to be used in the snapshots metadata
+machine = "Oribos"
