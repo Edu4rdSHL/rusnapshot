@@ -15,8 +15,9 @@ See the [docs folder](https://github.com/Edu4rdSHL/rusnapshot/blob/master/docs/)
 - Ability to use the same SQLite database for everything.
 - Ability to specify the prefix of the name for the snapshots for better identification.
 - Ability to specify a `kind` identifier to differentiate them in the database. Useful if you plan to have hourly, weekly, monthly or more "kind" of snapshots of the same subvolume(s).
+- Ability to specify the maximum number of snapshots to keep for automatic cleanup.
 - Supports restoration of snapshots in the original directory or a specific one.
-- Automatic snapshots cleanup.
+- Supports machine name identification for better tracking when using the same database in multiple machines.
 - Nice CLI output to see the status and details of snapshots.
 
 # Known limitations
