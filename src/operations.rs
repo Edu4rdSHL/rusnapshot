@@ -41,7 +41,7 @@ pub fn del_snapshot(snapshot_name: &str) -> bool {
 pub fn restore_snapshot(args: &Args, snapshot_name: &str) -> bool {
     !Path::new(&args.dest_dir).exists()
         && Command::new("btrfs")
-            .args(["subvolume", "snapshot", &snapshot_name, &args.dest_dir])
+            .args(["subvolume", "snapshot", snapshot_name, &args.dest_dir])
             .status()
             .expect("Error restoring the snapshot.")
             .success()

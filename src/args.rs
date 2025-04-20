@@ -23,7 +23,7 @@ pub struct Args {
     /// Snapshot id or name to work with.
     #[clap(long = "id", default_value = "")]
     pub snapshot_id: String,
-    /// Path to the SQLite database file.
+    /// Path to the `SQLite` database file.
     #[clap(
         short = 'd',
         long = "dfile",
@@ -40,7 +40,7 @@ pub struct Args {
     /// Keep only the last X items.
     #[clap(short = 'k', long = "keep", default_value = "10")]
     pub keep_only: usize,
-    /// Time in milliseconds until SQLite can return a timeout. Do not touch if you don't know what you are doing.
+    /// Time in milliseconds until `SQLite` can return a timeout. Do not touch if you don't know what you are doing.
     #[clap(long = "timeout", default_value = "5000")]
     pub timeout: usize,
     /// Create a read-only/ro snapshot.
