@@ -1,11 +1,15 @@
 # Description
-Simple and handy btrfs snapshoting tool. Supports unattended snapshots, tracking, restoring, automatic cleanup and more. Backed with SQLite.
+Simple and handy definitions-based snapshoting tool for BTRFS. Supports unattended snapshots, tracking, restoring, automatic cleanup and more. Backed with SQLite.
 
 # Documentation
 
 See the [docs folder](https://github.com/Edu4rdSHL/rusnapshot/blob/master/docs/).
 
 # Features
+
+**The main feature of Rustnapshot is the ability to create snapshots of BTRFS subvolumes using simple TOML definitions. It is designed to be simple and easy to use, while still providing powerful features for managing snapshots. See [the examples folder](https://github.com/Edu4rdSHL/rusnapshot/tree/master/examples) for more information.**
+
+Among the features of Rustnapshot are:
 
 - Allows you to specify the origin and destination of snapshots at will of the user.
 - Track snapshots using SQLite as backend database.
