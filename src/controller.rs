@@ -106,7 +106,7 @@ pub fn keep_only_x(args: &mut Args, extra_args: &mut ExtraArgs) -> Result<()> {
 
     for data in &snaps_data {
         extra_args.snapshot_name = data.destination.clone() + &data.name;
-        args.snapshot_id = data.snap_id.clone();
+        args.snapshot_id.clone_from(&data.snap_id);
 
         manage_deletion(args, extra_args)?;
     }
