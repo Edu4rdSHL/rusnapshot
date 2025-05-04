@@ -2,7 +2,6 @@
 name = "rusnapshot"
 version = "0.4.1"
 authors = ["edu4rdshl"]
-edition = "2018"
 description = "Simple and handy btrfs snapshoting tool."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -17,11 +16,3 @@ prettytable-rs = "0.10.0"
 anyhow = "1.0.98"
 toml = "0.8.22"
 hostname = "0.4.1"
-
-
-[profile.release]
-lto = true
-codegen-units = 1
-panic = 'abort'
-incremental = false
-opt-level = "s"
