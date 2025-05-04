@@ -2,7 +2,7 @@ use {
     crate::{args::Args, database, operations, structs::ExtraArgs},
     anyhow::Result,
     md5,
-    prettytable::{row, Table},
+    prettytable::{Table, row},
     sqlite::Connection,
 };
 
@@ -80,7 +80,7 @@ pub fn manage_listing(database_connection: &Connection) -> Result<()> {
        "SOURCE DIR",
        "DESTINATION DIR",
        "MACHINE",
-       "RO/RW",
+       "RW",
        "DATE"
     ]);
 
