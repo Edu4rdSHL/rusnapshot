@@ -38,10 +38,10 @@ pub struct Args {
     #[clap(long = "kind", default_value = "rusnapshot")]
     pub snapshot_kind: String,
     /// Keep only the last X items.
-    #[clap(short = 'k', long = "keep", default_value = "10")]
+    #[clap(short = 'k', long = "keep", default_value = "3")]
     pub keep_only: usize,
     /// Time in milliseconds until `SQLite` can return a timeout. Do not touch if you don't know what you are doing.
-    #[clap(long = "timeout", default_value = "5000")]
+    #[clap(long = "timeout", default_value = "10000")]
     pub timeout: usize,
     /// Create a read-only/ro snapshot.
     #[clap(long = "create", conflicts_with_all = &["restore_snapshot", "delete_snapshot", "list_snapshots", "clean_snapshots"])]
