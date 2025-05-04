@@ -10,13 +10,13 @@ description = "Simple and handy btrfs snapshoting tool."
 [dependencies]
 clap = { version = "4.5.37", features = ["derive", "env"] }
 serde = { version = "1.0.219", features = ["derive"] }
-sqlite = "0.33.0"
+sqlite = "0.37.0"
 md5 = "0.7.0"
-chrono = "0.4.40"
+chrono = "0.4.41"
 prettytable-rs = "0.10.0"
 anyhow = "1.0.98"
-toml = "0.8.20"
-hostname = "0.3.1"
+toml = "0.8.22"
+hostname = "0.4.1"
 
 
 [profile.release]
