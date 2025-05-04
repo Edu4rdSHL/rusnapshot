@@ -3,10 +3,10 @@ Description=Take system snapshots monthly.
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --cr --clean --kind monthly
-ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --cr --clean --kind monthly --rw
-ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --cr --clean --kind monthly
-ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --cr --clean --kind monthly --rw
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --create --kind monthly
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --clean --kind monthly
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --create --kind monthly
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --clean --kind monthly
 
 [Install]
 WantedBy=default.target
