@@ -5,17 +5,9 @@ LINUX_TARGET="x86_64-unknown-linux-musl"
 LINUX_X86_TARGET="i686-unknown-linux-musl"
 MANPAGE_DIR="./$NAME.1"
 
-if ! systemctl is-active docker >/dev/null 2>&1; then
-  echo "Docker is not running. Starting docker."
-  if ! sudo systemctl start docker; then
-    echo "Failed to start docker."
-    exit 1
-  fi
-fi
-
 # Linux build
 echo "Building Linux artifact."
-if cargo build -q --release --target="$LINUX_TARGET"; then
+if cross build -q --release --target="$LINUX_TARGET"; then
   echo "Linux artifact build: SUCCESS"
   cp "target/$LINUX_TARGET/release/$NAME" "target/$LINUX_TARGET/release/$NAME-linux"
   strip "target/$LINUX_TARGET/release/$NAME-linux"
@@ -44,11 +36,4 @@ if command -v help2man >/dev/null; then
   fi
 else
   echo "Please install the help2man package."
-fi
-
-# Stop docker
-echo "Stopping docker."
-if ! sudo systemctl stop docker; then
-  echo "Failed to stop docker."
-  exit 1
 fi
