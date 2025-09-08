@@ -1,5 +1,5 @@
 [Unit]
-Description=Take snapshots daily.
+Description=Take daily snapshots with rusnapshot
 
 [Timer]
 OnCalendar=daily

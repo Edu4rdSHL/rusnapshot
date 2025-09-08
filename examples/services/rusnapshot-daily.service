@@ -1,5 +1,5 @@
 [Unit]
-Description=Snapshot root directory.
+Description=Daily snapshots for home and root subvolumes
 
 [Service]
 Type=oneshot

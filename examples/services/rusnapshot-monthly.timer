@@ -1,5 +1,5 @@
 [Unit]
-Description=Take system snapshots monthly.
+Description=Take monthly snapshots with rusnapshot
 
 [Timer]
 OnCalendar=monthly
