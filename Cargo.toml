@@ -8,13 +8,13 @@ description = "Simple and handy btrfs snapshoting tool."
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.5.43", features = ["derive", "env"] }
+clap = { version = "4.5.47", features = ["derive", "env"] }
 serde = { version = "1.0.219", features = ["derive"] }
 sqlite = "0.37.0"
 md5 = "0.8.0"
-chrono = "0.4.41"
+chrono = "0.4.42"
 prettytable-rs = "0.10.0"
-anyhow = "1.0.98"
+anyhow = "1.0.99"
 toml = "0.9.5"
 hostname = "0.4.1"
 
