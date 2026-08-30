@@ -1,51 +1,42 @@
 use {
     anyhow::Result,
-    chrono::Utc,
-    clap::Parser,
-    rusnapshot::{args, controller, structs::ExtraArgs, utils},
+    rusnapshot::{args::Args, controller, database, operations},
 };
 
 fn try_run() -> Result<()> {
-    let mut arguments = args::Args::parse();
+    let mut args = Args::parse_with_config()?;
+    args.normalize()?;
 
-    if arguments.config_file.is_some() {
-        arguments.from_config_file()?;
-    }
-
-    let mut extra_args = ExtraArgs {
-        snapshot_name: format!(
-            "{}-{}",
-            arguments.snapshot_prefix,
-            Utc::now().format("%Y-%m-%d-%H-%M-%S-%6f")
-        ),
-        database_connection: arguments.database_connection(),
-    };
-
-    if arguments.create_snapshot {
-        utils::check_creation_requirements(&mut arguments, &extra_args)?;
+    if args.create_snapshot {
+        args.check_creation_requirements()?;
+        operations::setup_directory_structure(&args.dest_dir, args.dry_run)?;
     }
 
-    if arguments.create_snapshot {
-        controller::manage_creation(&mut arguments, &extra_args)?;
+    let connection = database::open(&args)?;
+
+    if args.create_snapshot {
+        controller::manage_creation(&args, &connection)?;
     }
-    if arguments.delete_snapshot {
-        controller::manage_deletion(&arguments, &mut extra_args)?;
+    if args.delete_snapshot {
+        controller::manage_deletion(&args, &connection)?;
     }
-    if arguments.list_snapshots {
-        controller::manage_listing(&extra_args.database_connection)?;
+    if args.clean_snapshots {
+        controller::keep_only_x(&args, &connection)?;
     }
-    if arguments.clean_snapshots {
-        controller::keep_only_x(&mut arguments, &mut extra_args)?;
+    if args.restore_snapshot {
+        controller::manage_restoring(&args, &connection)?;
     }
-    if arguments.restore_snapshot {
-        controller::manage_restoring(&mut arguments, &mut extra_args)?;
+    // Listing goes last so that combined with --clean it shows the resulting state.
+    if args.list_snapshots {
+        controller::manage_listing(&connection)?;
     }
+
     Ok(())
 }
 
 fn main() {
     if let Err(err) = try_run() {
-        eprintln!("\nError: {err}");
+        eprintln!("Error: {err:#}");
         std::process::exit(1);
     }
 }

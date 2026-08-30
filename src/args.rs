@@ -1,30 +1,28 @@
 use {
-    crate::{database, operations, structs::ExtraArgs},
-    anyhow::Result,
-    clap::Parser,
-    serde::{Deserialize, Serialize},
-    sqlite::Connection,
-    std::collections::BTreeMap,
+    crate::utils,
+    anyhow::{Context, Result, bail},
+    clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource},
+    serde::Deserialize,
 };
 
 /// Simple and handy btrfs snapshoting tool.
-#[derive(Parser, Debug, Default, Serialize, Deserialize, Clone)]
-#[clap(author, version, about, long_about = None, arg_required_else_help = true)]
+#[derive(Parser, Debug, Default, Clone)]
+#[command(author, version, about, long_about = None, arg_required_else_help = true)]
 pub struct Args {
-    /// Path to configuration file.
-    #[clap(short = 'c', long = "config")]
+    /// Path to configuration file. Options given on the command line take precedence over it.
+    #[arg(short = 'c', long = "config")]
     pub config_file: Option<String>,
-    /// Directory where snapshots should be saved.
-    #[clap(long = "to", requires_all = &["create_snapshot"], default_value = "")]
+    /// Directory where snapshots should be saved. With --restore, directory where the snapshot will be restored (must not exist).
+    #[arg(long = "to", default_value = "", conflicts_with_all = ["delete_snapshot", "clean_snapshots"])]
     pub dest_dir: String,
-    /// Directory from where snapshots should be created. It can also be used to specify the directory where a snapshot will be restored.
-    #[clap(long = "from", requires_all = &["create_snapshot"], default_value = "")]
+    /// Directory (subvolume) from where snapshots should be created.
+    #[arg(long = "from", default_value = "", conflicts_with_all = ["restore_snapshot", "delete_snapshot", "clean_snapshots"])]
     pub source_dir: String,
     /// Snapshot id or name to work with.
-    #[clap(long = "id", default_value = "")]
+    #[arg(long = "id", default_value = "")]
     pub snapshot_id: String,
     /// Path to the `SQLite` database file.
-    #[clap(
+    #[arg(
         short = 'd',
         long = "dfile",
         env = "RUSNAPSHOT_DB_FILE",
@@ -32,132 +30,383 @@ pub struct Args {
     )]
     pub database_file: String,
     /// Prefix for the snapshot name.
-    #[clap(short = 'p', long = "prefix", default_value = "rusnapshot")]
+    #[arg(short = 'p', long = "prefix", default_value = "rusnapshot")]
     pub snapshot_prefix: String,
     /// Used to specify a differentiator between snapshots with the same prefix.
-    #[clap(long = "kind", default_value = "rusnapshot")]
+    #[arg(long = "kind", default_value = "rusnapshot")]
     pub snapshot_kind: String,
     /// Keep only the last X items.
-    #[clap(short = 'k', long = "keep", default_value = "3")]
+    #[arg(short = 'k', long = "keep", default_value = "3")]
     pub keep_only: usize,
     /// Time in milliseconds until `SQLite` can return a timeout. Do not touch if you don't know what you are doing.
-    #[clap(long = "timeout", default_value = "10000")]
+    #[arg(long = "timeout", default_value = "10000")]
     pub timeout: usize,
     /// Create a read-only/ro snapshot.
-    #[clap(long = "create", conflicts_with_all = &["restore_snapshot", "delete_snapshot", "list_snapshots", "clean_snapshots"])]
+    #[arg(
+        long = "create",
+        group = "operation",
+        conflicts_with = "list_snapshots"
+    )]
     pub create_snapshot: bool,
     /// Enable snapshots cleaning, will keep only the last X snapshots specified with -k/--keep.
-    /// This option requires: -k/--keep, -p/--prefix and --kind via command line or configuration file.
-    #[clap(long = "clean")]
+    /// Only the snapshots whose name starts with -p/--prefix and that match --kind, -m/--machine and the ro/rw mode (see --rw) are considered.
+    #[arg(long = "clean", group = "operation")]
     pub clean_snapshots: bool,
     /// Delete a snapshot.
-    #[clap(long = "del", requires_all = &["snapshot_id"])]
+    #[arg(long = "del", group = "operation", requires = "snapshot_id")]
     pub delete_snapshot: bool,
-    /// Restore a specific snapshot.
-    #[clap(short = 'r', long = "restore", requires_all = &["snapshot_id"])]
+    /// Restore a specific snapshot to its original source directory, or to --to if given. The target must not exist.
+    #[arg(
+        short = 'r',
+        long = "restore",
+        group = "operation",
+        requires = "snapshot_id"
+    )]
     pub restore_snapshot: bool,
     /// List the snapshots tracked in the database.
-    #[clap(short = 'l', long = "list")]
+    #[arg(short = 'l', long = "list")]
     pub list_snapshots: bool,
-    /// Create read-write/rw snapshots.
-    #[clap(short = 'w', long = "rw")]
+    /// Create read-write/rw snapshots. With --clean, work on rw snapshots instead of ro ones.
+    #[arg(short = 'w', long = "rw")]
     pub read_write: bool,
-    /// Machine name to be used in the metadata.
-    #[clap(short, long, default_value = "")]
+    /// Machine name to be used in the metadata and to select the snapshots to clean. Defaults to the hostname.
+    #[arg(short, long, default_value = "")]
     pub machine: String,
+    /// Show what would be created, deleted or restored without doing it.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 impl Args {
-    /// Get the database connection string.
-    #[must_use]
-    pub fn database_connection(&self) -> Connection {
-        match sqlite::open(&self.database_file) {
-            Ok(mut connection) => {
-                connection
-                    .set_busy_timeout(self.timeout)
-                    .expect("Failed to set database timeout");
-
-                connection
-            }
-            Err(e) => {
-                eprintln!("Error while trying to stablish the database connection. Error: {e}");
-                std::process::exit(1)
-            }
-        }
+    /// Parse the command line and, when `-c/--config` is given, fill from the file every option
+    /// that was not explicitly set on the command line or through an environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the configuration file can't be read or parsed.
+    pub fn parse_with_config() -> Result<Self> {
+        let matches = Self::command().get_matches();
+        Self::from_matches(&matches)
     }
 
-    /// Initialize the database and directory structure.
-    pub fn init(&self, extra_args: &ExtraArgs) -> Result<()> {
-        if !std::path::Path::new(&self.dest_dir).exists() {
-            println!("Setting up the directory structure.");
-            operations::setup_directory_structure(self)?;
+    /// Same as [`Self::parse_with_config`] but from already parsed matches.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the matches can't be converted or the configuration file can't be read or parsed.
+    pub fn from_matches(matches: &ArgMatches) -> Result<Self> {
+        let mut args = Self::from_arg_matches(matches)?;
+        if let Some(path) = args.config_file.clone() {
+            let config = Config::from_file(&path)?;
+            config.merge_into(&mut args, |id| {
+                matches!(
+                    matches.value_source(id),
+                    Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                )
+            });
         }
-        database::setup_initial_database(&extra_args.database_connection)?;
+
+        Ok(args)
+    }
+
+    /// Make the source and destination directories absolute with a trailing slash, fill the
+    /// machine name from the hostname when empty and validate the snapshot prefix.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a path can't be resolved, the hostname can't be read or the prefix is invalid.
+    pub fn normalize(&mut self) -> Result<()> {
+        if !self.source_dir.is_empty() {
+            self.source_dir = utils::normalize_dir(&self.source_dir)?;
+        }
+        if !self.dest_dir.is_empty() {
+            self.dest_dir = utils::normalize_dir(&self.dest_dir)?;
+        }
+        if self.machine.is_empty() {
+            self.machine = utils::machine_name()?;
+        }
+        if self.snapshot_prefix.is_empty() || self.snapshot_prefix.contains('/') {
+            bail!("the snapshot prefix must not be empty or contain '/'");
+        }
+        if self.database_file.is_empty() {
+            bail!("the database file path (-d/--dfile) must not be empty");
+        }
 
         Ok(())
     }
 
-    pub fn check_for_source_and_dest_dir(&mut self) {
+    /// Both directories are needed to take a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the source or the destination directory is missing.
+    pub fn check_creation_requirements(&self) -> Result<()> {
         if self.source_dir.is_empty() || self.dest_dir.is_empty() {
-            eprintln!("Specify both source and destination directories before taking a snapshot.");
-            std::process::exit(1);
-        }
-    }
-
-    /// Deserialize the configuration file.
-    pub fn from_config_file(&mut self) -> Result<()> {
-        let config_file = std::fs::read_to_string(self.config_file.as_deref().unwrap())?;
-        let config: BTreeMap<String, toml::Value> = toml::from_str(&config_file)?;
-
-        if let Some(dest_dir) = config.get("dest_dir") {
-            self.dest_dir = dest_dir
-                .as_str()
-                .expect("Failed to parse dest_dir")
-                .to_string();
-        }
-        if let Some(source_dir) = config.get("source_dir") {
-            self.source_dir = source_dir
-                .as_str()
-                .expect("Failed to parse source_dir")
-                .to_string();
-        }
-        if let Some(snapshot_prefix) = config.get("snapshot_prefix") {
-            self.snapshot_prefix = snapshot_prefix
-                .as_str()
-                .expect("Failed to parse snapshot_prefix")
-                .to_string();
-        }
-        if let Some(snapshot_kind) = config.get("snapshot_kind") {
-            self.snapshot_kind = snapshot_kind
-                .as_str()
-                .expect("Failed to parse snapshot_kind")
-                .to_string();
-        }
-        if let Some(database_file) = config.get("database_file") {
-            self.database_file = database_file
-                .as_str()
-                .expect("Failed to parse database_file")
-                .to_string();
-        }
-        if let Some(keep_only) = config.get("keep_only") {
-            self.keep_only = keep_only
-                .to_string()
-                .parse()
-                .expect("Failed to parse keep_only, make sure it's a number");
-        }
-        if let Some(timeout) = config.get("timeout") {
-            self.timeout = timeout
-                .to_string()
-                .parse()
-                .expect("Failed to parse timeout, make sure it's a number");
-        }
-        if let Some(machine) = config.get("machine") {
-            self.machine = machine
-                .to_string()
-                .parse()
-                .expect("Failed to parse machine");
+            bail!(
+                "specify both the source (--from) and the destination (--to) directories before taking a snapshot"
+            );
         }
 
         Ok(())
+    }
+}
+
+/// Options accepted in the TOML configuration file. All of them are optional.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct Config {
+    pub dest_dir: Option<String>,
+    pub source_dir: Option<String>,
+    pub snapshot_prefix: Option<String>,
+    pub snapshot_kind: Option<String>,
+    pub database_file: Option<String>,
+    pub keep_only: Option<usize>,
+    pub timeout: Option<usize>,
+    pub machine: Option<String>,
+}
+
+impl Config {
+    pub const KNOWN_KEYS: [&'static str; 8] = [
+        "dest_dir",
+        "source_dir",
+        "snapshot_prefix",
+        "snapshot_kind",
+        "database_file",
+        "keep_only",
+        "timeout",
+        "machine",
+    ];
+
+    /// Read and parse a configuration file.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file can't be read or is not valid.
+    pub fn from_file(path: &str) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read the configuration file {path}"))?;
+        Self::parse(&content).with_context(|| format!("invalid configuration file {path}"))
+    }
+
+    /// Parse the TOML content. Unknown keys are reported on stderr and ignored.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the content is not valid TOML or a value has the wrong type.
+    pub fn parse(content: &str) -> Result<Self> {
+        let table: toml::Table = toml::from_str(content)?;
+        for key in table.keys() {
+            if !Self::KNOWN_KEYS.contains(&key.as_str()) {
+                eprintln!(
+                    "Warning: unknown option '{key}' in the configuration file, ignoring it."
+                );
+            }
+        }
+
+        Ok(toml::from_str(content)?)
+    }
+
+    /// Copy the values present in the file into `args`, except for the options where
+    /// `is_explicit(<field name>)` is true (the user already set them on the command line).
+    pub fn merge_into(self, args: &mut Args, is_explicit: impl Fn(&str) -> bool) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    if !is_explicit(stringify!($field)) {
+                        args.$field = value;
+                    }
+                }
+            };
+        }
+        apply!(dest_dir);
+        apply!(source_dir);
+        apply!(snapshot_prefix);
+        apply!(snapshot_kind);
+        apply!(database_file);
+        apply!(keep_only);
+        apply!(timeout);
+        apply!(machine);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{Args, Config},
+        clap::CommandFactory,
+    };
+
+    const FULL: &str = r#"
+dest_dir = "/.snapshots"
+source_dir = "/"
+database_file = "/.snapshots/rusnapshot.db"
+snapshot_prefix = "root"
+snapshot_kind = "weekly"
+keep_only = 5
+timeout = 2000
+machine = "Oribos"
+"#;
+
+    #[test]
+    fn parse_typed_values() {
+        let config = Config::parse(FULL).unwrap();
+        assert_eq!(config.dest_dir.as_deref(), Some("/.snapshots"));
+        assert_eq!(config.source_dir.as_deref(), Some("/"));
+        assert_eq!(
+            config.database_file.as_deref(),
+            Some("/.snapshots/rusnapshot.db")
+        );
+        assert_eq!(config.snapshot_prefix.as_deref(), Some("root"));
+        assert_eq!(config.snapshot_kind.as_deref(), Some("weekly"));
+        assert_eq!(config.keep_only, Some(5));
+        assert_eq!(config.timeout, Some(2000));
+        // The value must not carry the TOML quotes.
+        assert_eq!(config.machine.as_deref(), Some("Oribos"));
+    }
+
+    #[test]
+    fn parse_partial_and_unknown_keys() {
+        let config = Config::parse("snapshot_prefix = \"home\"\nsomething_else = 1\n").unwrap();
+        assert_eq!(config.snapshot_prefix.as_deref(), Some("home"));
+        assert_eq!(config.keep_only, None);
+        assert_eq!(Config::parse("").unwrap(), Config::default());
+    }
+
+    #[test]
+    fn parse_rejects_wrong_types() {
+        let err = Config::parse("keep_only = \"3\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("keep_only"), "{err}");
+        assert!(Config::parse("machine = 3\n").is_err());
+        assert!(Config::parse("this is not toml").is_err());
+    }
+
+    #[test]
+    fn merge_fills_only_non_explicit_options() {
+        let config = Config::parse(FULL).unwrap();
+        let mut args = Args {
+            snapshot_kind: "daily".into(),
+            keep_only: 3,
+            machine: "cli".into(),
+            ..Args::default()
+        };
+        config.merge_into(&mut args, |id| matches!(id, "snapshot_kind" | "machine"));
+
+        assert_eq!(args.snapshot_kind, "daily");
+        assert_eq!(args.machine, "cli");
+        assert_eq!(args.keep_only, 5);
+        assert_eq!(args.timeout, 2000);
+        assert_eq!(args.dest_dir, "/.snapshots");
+        assert_eq!(args.source_dir, "/");
+        assert_eq!(args.snapshot_prefix, "root");
+        assert_eq!(args.database_file, "/.snapshots/rusnapshot.db");
+    }
+
+    #[test]
+    fn merge_keeps_args_when_file_lacks_the_option() {
+        let config = Config::parse("snapshot_prefix = \"home\"\n").unwrap();
+        let mut args = Args {
+            snapshot_kind: "daily".into(),
+            ..Args::default()
+        };
+        config.merge_into(&mut args, |_| false);
+        assert_eq!(args.snapshot_prefix, "home");
+        assert_eq!(args.snapshot_kind, "daily");
+    }
+
+    #[test]
+    fn normalize_validates_prefix_and_database_file() {
+        let mut args = Args {
+            snapshot_prefix: String::new(),
+            database_file: "/db".into(),
+            machine: "m".into(),
+            ..Args::default()
+        };
+        assert!(args.normalize().is_err());
+        args.snapshot_prefix = "a/b".into();
+        assert!(args.normalize().is_err());
+        args.snapshot_prefix = "root".into();
+        args.database_file = String::new();
+        assert!(args.normalize().is_err());
+        args.database_file = "/db".into();
+        args.source_dir = "/home".into();
+        args.normalize().unwrap();
+        assert_eq!(args.source_dir, "/home/");
+        assert_eq!(args.dest_dir, "");
+    }
+
+    /// The precedence logic relies on the clap argument ids being the field names, for every
+    /// option that can also come from the configuration file.
+    #[test]
+    fn from_matches_applies_precedence_for_every_option() {
+        let dir = std::env::temp_dir().join(format!("rusnapshot-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, FULL).unwrap();
+        let file = file.to_str().unwrap();
+
+        // Nothing explicit: everything comes from the file.
+        let matches = Args::command()
+            .try_get_matches_from(["rusnapshot", "-c", file, "--list"])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.dest_dir, "/.snapshots");
+        assert_eq!(args.source_dir, "/");
+        assert_eq!(args.snapshot_prefix, "root");
+        assert_eq!(args.snapshot_kind, "weekly");
+        assert_eq!(args.keep_only, 5);
+        assert_eq!(args.timeout, 2000);
+        assert_eq!(args.machine, "Oribos");
+        // An environment variable counts as explicit, so only check the file value without it.
+        if std::env::var_os("RUSNAPSHOT_DB_FILE").is_none() {
+            assert_eq!(args.database_file, "/.snapshots/rusnapshot.db");
+        }
+
+        // Everything given on the command line wins over the file.
+        let matches = Args::command()
+            .try_get_matches_from([
+                "rusnapshot",
+                "-c",
+                file,
+                "--create",
+                "--to",
+                "/d",
+                "--from",
+                "/s",
+                "-p",
+                "p",
+                "--kind",
+                "k",
+                "-d",
+                "/db",
+                "-k",
+                "9",
+                "--timeout",
+                "1",
+                "-m",
+                "m",
+            ])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.dest_dir, "/d");
+        assert_eq!(args.source_dir, "/s");
+        assert_eq!(args.snapshot_prefix, "p");
+        assert_eq!(args.snapshot_kind, "k");
+        assert_eq!(args.database_file, "/db");
+        assert_eq!(args.keep_only, 9);
+        assert_eq!(args.timeout, 1);
+        assert_eq!(args.machine, "m");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn creation_requires_both_directories() {
+        let mut args = Args::default();
+        assert!(args.check_creation_requirements().is_err());
+        args.source_dir = "/".into();
+        assert!(args.check_creation_requirements().is_err());
+        args.dest_dir = "/.snapshots/".into();
+        args.check_creation_requirements().unwrap();
     }
 }
