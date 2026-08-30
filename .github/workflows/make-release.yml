@@ -1,0 +1,120 @@
+name: Create release artifacts
+
+on:
+  push:
+    tags:
+      # Stable tags such as 0.6.0, and pre-releases such as 0.6.0-beta.1.
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+
+env:
+  # Pinned so a new cross release cannot change how a tag builds.
+  CROSS_VERSION: v0.2.5
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        type: [linux-x64, linux-i386, armv7, aarch64]
+        include:
+          - type: linux-x64
+            target: x86_64-unknown-linux-musl
+            bin: rusnapshot-linux
+            asset: rusnapshot-linux-x64
+          - type: linux-i386
+            target: i686-unknown-linux-musl
+            bin: rusnapshot-linux-i386
+            asset: rusnapshot-linux-i386
+          - type: armv7
+            target: armv7-unknown-linux-gnueabihf
+            bin: rusnapshot-armv7
+            asset: rusnapshot-armv7
+          - type: aarch64
+            target: aarch64-unknown-linux-gnu
+            bin: rusnapshot-aarch64
+            asset: rusnapshot-aarch64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # cross builds inside a container that already carries the C toolchain
+      # each target needs (sqlite3-src compiles C), so nothing else is set up.
+      - name: Install cross
+        run: |
+          curl -fsSL "https://github.com/cross-rs/cross/releases/download/${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar xz -C /usr/local/bin cross
+          cross --version
+
+      # No strip step: [profile.release] already sets strip = true, so the
+      # linker drops the symbols for every target.
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      # The binary is named the way builder.sh always named it inside the zip.
+      - name: Rename the binary
+        run: cp "target/${{ matrix.target }}/release/rusnapshot" "${{ matrix.bin }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.bin }}
+          if-no-files-found: error
+
+  release:
+    name: Attach the binaries to the release
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      # One zip per artifact, named after it, with a sha512 checksum of the
+      # zip next to it so downloads can be verified.
+      - name: Zip each binary
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$name" && zip -q -r "../${name}.zip" .)
+            sha512sum "${name}.zip" > "${name}.zip.sha512"
+          done
+          ls -l ./*.zip ./*.sha512
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # A tag such as 0.6.0-beta.1 is a pre-release; 0.6.0 is not.
+          case "$tag" in
+            *-*) prerelease="--prerelease" ;;
+            *)   prerelease="" ;;
+          esac
+
+          notes="docs/releases/${tag}.md"
+          if [ -f "$notes" ]; then
+            body="--notes-file $notes"
+          else
+            echo "::warning::$notes is missing, falling back to generated notes"
+            body="--generate-notes"
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/*.zip artifacts/*.sha512 --clobber
+          else
+            # shellcheck disable=SC2086
+            gh release create "$tag" artifacts/*.zip artifacts/*.sha512 \
+              --title "Rusnapshot $tag" \
+              $body $prerelease
+          fi

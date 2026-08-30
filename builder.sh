@@ -16,7 +16,6 @@ echo "Building Linux artifact."
 if cross build -q --release --target="$LINUX_TARGET"; then
   echo "Linux artifact build: SUCCESS"
   cp "target/$LINUX_TARGET/release/$NAME" "target/$LINUX_TARGET/release/$NAME-linux"
-  strip "target/$LINUX_TARGET/release/$NAME-linux"
   sha512sum "target/$LINUX_TARGET/release/$NAME-linux" >"$BIN_OUTPUT_DIR/$NAME-linux.sha512"
   zip -q -j "$BIN_OUTPUT_DIR/$NAME-linux-x64.zip" "target/$LINUX_TARGET/release/$NAME-linux"
 else
@@ -28,7 +27,6 @@ echo "Building Linux x86 artifact."
 if cross build -q --release --target="$LINUX_X86_TARGET"; then
   echo "Linux x86 artifact build: SUCCESS"
   cp "target/$LINUX_X86_TARGET/release/$NAME" "target/$LINUX_X86_TARGET/release/$NAME-linux-i386"
-  strip "target/$LINUX_X86_TARGET/release/$NAME-linux-i386"
   sha512sum "target/$LINUX_X86_TARGET/release/$NAME-linux-i386" >"$BIN_OUTPUT_DIR/$NAME-linux-i386.sha512"
   zip -q -j "$BIN_OUTPUT_DIR/$NAME-linux-i386.zip" "target/$LINUX_X86_TARGET/release/$NAME-linux-i386"
 else
@@ -40,7 +38,6 @@ echo "Building ARMv7 artifact."
 if cross build -q --release --target="$ARMV7_TARGET"; then
   echo "ARMv7 artifact build: SUCCESS"
   cp "target/$ARMV7_TARGET/release/$NAME" "target/$ARMV7_TARGET/release/$NAME-armv7"
-  strip "target/$ARMV7_TARGET/release/$NAME-armv7"
   sha512sum "target/$ARMV7_TARGET/release/$NAME-armv7" >"$BIN_OUTPUT_DIR/$NAME-armv7.sha512"
   zip -q -j "$BIN_OUTPUT_DIR/$NAME-armv7.zip" "target/$ARMV7_TARGET/release/$NAME-armv7"
 else
@@ -52,7 +49,6 @@ echo "Building Aarch64 artifact."
 if cross build -q --release --target="$AARCH_TARGET"; then
   echo "Aarch64 artifact build: SUCCESS"
   cp "target/$AARCH_TARGET/release/$NAME" "target/$AARCH_TARGET/release/$NAME-aarch64"
-  strip "target/$AARCH_TARGET/release/$NAME-aarch64"
   sha512sum "target/$AARCH_TARGET/release/$NAME-aarch64" >"$BIN_OUTPUT_DIR/$NAME-aarch64.sha512"
   zip -q -j "$BIN_OUTPUT_DIR/$NAME-aarch64.zip" "target/$AARCH_TARGET/release/$NAME-aarch64"
 else

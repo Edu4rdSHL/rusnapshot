@@ -9,7 +9,7 @@
             "request": "launch",
             "name": "Debug",
             "program": "${workspaceRoot}/target/debug/${workspaceRootFolderName}",
-            "args": "--cr -p root -d snapshots -t /mnt/defvol/_snapshots/ -s /mnt/defvol/_active/root/",
+            "args": ["--create", "--prefix", "root", "--dfile", "/mnt/defvol/_snapshots/rusnapshot.db", "--to", "/mnt/defvol/_snapshots/", "--from", "/mnt/defvol/_active/root/"],
             "cwd": "${workspaceRoot}",
             "sourceLanguages": [
                 "rust"
