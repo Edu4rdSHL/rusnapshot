@@ -21,14 +21,15 @@ Among the features of Rustnapshot are:
 - Ability to specify a `kind` identifier to differentiate them in the database. Useful if you plan to have hourly, weekly, monthly or more "kind" of snapshots of the same subvolume(s).
 - Ability to specify the maximum number of snapshots to keep for automatic cleanup.
 - Supports restoration of snapshots in the original directory or a specific one.
-- Supports machine name identification for better tracking when using the same database in multiple machines.
+- Supports machine name identification for better tracking when using the same database in multiple machines. Automatic cleanup only touches the snapshots of the machine running it.
+- `--dry-run` to see what would be created, deleted or restored without touching anything.
 - Nice CLI output to see the status and details of snapshots.
 
 # Known limitations
 
-Due to SQLite limitations to handle concurrent database operations, we need to make use of SQLite's [busy_timeout](https://www.sqlite.org/c3ref/busy_timeout.html), which was initially implemented in [ce44bf6](https://github.com/Edu4rdSHL/rusnapshot/commit/ce44bf679c73d221811ac775561916a8c5761243). Without it you will get the error: `Error: database is locked (code 5)` if you try to make concurrent snapshots exactly at the same time. The default timeout is 5 seconds which is more than enough time so that no problem occurs even in the most demanding scenarios.
+Due to SQLite limitations to handle concurrent database operations, we need to make use of SQLite's [busy_timeout](https://www.sqlite.org/c3ref/busy_timeout.html), which was initially implemented in [ce44bf6](https://github.com/Edu4rdSHL/rusnapshot/commit/ce44bf679c73d221811ac775561916a8c5761243). Without it you will get the error: `Error: database is locked (code 5)` if you try to make concurrent snapshots exactly at the same time. The default timeout is 10 seconds which is more than enough time so that no problem occurs even in the most demanding scenarios.
 
-In summary, `busy_timeout` is the maximum time that SQLite will retry the failed transaction. Considering that Rusnapshot's database operations are small and shouldn't take long, 5 seconds is a decent time. If you continue to get the mentioned error, try increasing `--timeout`, remember that the value must be in milliseconds.
+In summary, `busy_timeout` is the maximum time that SQLite will retry the failed transaction. Considering that Rusnapshot's database operations are small and shouldn't take long, 10 seconds is a decent time. If you continue to get the mentioned error, try increasing `--timeout`, remember that the value must be in milliseconds.
 
 # Screenshots
 

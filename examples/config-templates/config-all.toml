@@ -1,5 +1,6 @@
 # Example configuration file for rusnapshot
-# These are all the current available options
+# These are all the current available options. All of them are optional, and options
+# given on the command line take precedence over the values in this file.
 
 # Snapshots directory
 dest_dir = "/.snapshots"
@@ -9,9 +10,13 @@ source_dir = "/"
 database_file = "/.snapshots/rusnapshot.db"
 # Prefix for the snapshots, they will be saved in the format prefix-$current_date
 snapshot_prefix = "root"
-# Snapshots identifier
+# Snapshots identifier. Usually given on the command line (--kind) so the same file
+# can be used for daily, weekly and monthly snapshots.
 snapshot_kind = "weekly"
-# Last snapshots to keep. If prefix is specified then only the snapshots with that prefix will be deleted
+# Last snapshots to keep when running with --clean. Only the snapshots with the same
+# prefix, kind, machine and ro/rw mode are considered.
 keep_only = 3
-# Machine name to be used in the snapshots metadata
+# SQLite busy timeout in milliseconds
+timeout = 10000
+# Machine name to be used in the snapshots metadata. Defaults to the hostname.
 machine = "Oribos"
