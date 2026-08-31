@@ -20,3 +20,15 @@ keep_only = 3
 timeout = 10000
 # Machine name to be used in the snapshots metadata. Defaults to the hostname.
 machine = "Oribos"
+
+# Replication targets for --send (btrfs send/receive). Repeat the section for
+# several targets. See docs/SETUP_AND_USAGE.md, section Replication.
+[[replicate]]
+# Absolute path (an external disk) or ssh://[user@]host[:port]/path
+target = "ssh://backup@nas/srv/backups/oribos"
+# Replicas to keep per kind at the target; omit to never delete anything there
+keep = 30
+# For ssh targets the btrfs commands run as `sudo -n btrfs`, so the ssh user
+# needs passwordless sudo (or be root).
+# Extra ssh options, rusnapshot runs as root and does not see your ~/.ssh/config
+ssh_options = ["-i", "/root/.ssh/backup_key"]

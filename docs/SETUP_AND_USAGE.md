@@ -48,6 +48,16 @@
 
 `sudo rusnapshot --id {{snapshot_id}} --restore --to {{/path/to/restore}}`
 
+- Replicate the snapshots to the targets defined in the config file (see Replication below):
+
+`sudo rusnapshot -c {{path/to/config.toml}} --send`
+
+- Replicate to a target given on the command line, an external disk or a host through ssh:
+
+`sudo rusnapshot -c {{path/to/config.toml}} --send --target /mnt/usb/backups`
+
+`sudo rusnapshot -c {{path/to/config.toml}} --send --target ssh://backup@nas/srv/backups/behemoth`
+
 # Notes
 
 ## Configuration file and precedence
@@ -82,6 +92,47 @@ sudo rusnapshot --id {{snapshot_id}} --restore
 
 Use `--to` to restore somewhere else. Restoring the root subvolume in place requires booting from another system or mounting the top-level subvolume, since `/` can't be moved while in use.
 
+## Replication
+
+`--send` replicates the snapshots with `btrfs send`/`btrfs receive` to a directory on another btrfs filesystem: an external disk, or another machine through ssh.
+
+```toml
+[[replicate]]
+target = "ssh://backup@nas:2222/srv/backups/behemoth"
+# Replicas to keep per kind at the target. Omit it to never delete anything there.
+keep = 30
+# Extra ssh options. rusnapshot usually runs as root, which does not see your
+# ~/.ssh/config, so give it the key and the known_hosts file it should use.
+ssh_options = ["-i", "/root/.ssh/backup_key", "-o", "UserKnownHostsFile=/root/.ssh/known_hosts"]
+
+[[replicate]]
+target = "/mnt/usb/backups"
+```
+
+Add `--send` to the units after `--create`:
+
+```
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --create --kind daily
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --send
+ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --clean --kind daily
+```
+
+How it works:
+
+- `--send` replicates every read-only snapshot of the config's `--prefix` and `-m/--machine` that is not yet at the target, oldest first, whatever its kind. Read-write snapshots can't be sent by btrfs and are skipped.
+- The first send of a subvolume is full. Every later one is incremental (`btrfs send -p`) from the newest replica of the same source subvolume that still exists on both sides; only the changes are sent. If that replica disappeared from the target, it is forgotten (and sent again later) and the next one is tried; with no usable parent the send is full again.
+- After each transfer the target filesystem is synced (`btrfs filesystem sync`), so the data is written to the disk before the replica is recorded; the reported time includes that. Then the `Received UUID` at the target is compared with the UUID of the source snapshot. Only then it is recorded in the database. A transfer that fails is removed from the target and retried on the next run, and rusnapshot exits with a non-zero status.
+- If the target already holds a matching replica that the database does not know about (for example after restoring the database), it is adopted instead of sent again.
+- With `keep`, after sending, the replicas beyond the newest `keep` ones of each kind are deleted at the target. They are remembered as pruned so the local snapshots are not sent there again. `keep` must be at least 1: the newest replica is the parent of the next incremental send.
+- Several targets can be configured; each one is processed independently. `--target` on the command line replaces the configured targets for that run.
+- `--dry-run` prints what would be sent and pruned without contacting the target.
+
+Requirements: the target directory must already exist on a btrfs filesystem (rusnapshot does not create it, so an unmounted backup disk is reported as an error instead of being written to the mount point); `btrfs-progs` at the target; for ssh, key based authentication that works non-interactively (`BatchMode=yes` is always set) and **passwordless sudo for the ssh user**: the `btrfs` commands at the target need root and rusnapshot always runs them as `sudo -n btrfs ...` (logging in as root works too). Only `btrfs` goes through sudo, so a rule such as `backup ALL=(root) NOPASSWD: /usr/bin/btrfs` is enough; check it with `ssh backup@nas sudo -n btrfs --version`. The ssh user must also be able to read the target directory. A host without a btrfs filesystem can still be a target with a loop-mounted image: `truncate -s 200G backups.img && mkfs.btrfs backups.img && mount -o loop backups.img /srv/backups`.
+
+Keep the local retention (`keep_only`) at 2 or more when replicating: if `--clean` deletes the newest replicated snapshot before the next send, that send has no parent and is full again.
+
+`--list` prints the replicas present at each target below the snapshots table.
+
 ## Exit codes
 
-`rusnapshot` exits with a non-zero status whenever a snapshot can't be created, deleted or restored, so failures are visible to systemd and scripts.
+`rusnapshot` exits with a non-zero status whenever a snapshot can't be created, deleted, restored or replicated, so failures are visible to systemd and scripts.

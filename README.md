@@ -22,7 +22,8 @@ Among the features of Rustnapshot are:
 - Ability to specify the maximum number of snapshots to keep for automatic cleanup.
 - Supports restoration of snapshots in the original directory or a specific one.
 - Supports machine name identification for better tracking when using the same database in multiple machines. Automatic cleanup only touches the snapshots of the machine running it.
-- `--dry-run` to see what would be created, deleted or restored without touching anything.
+- Replication to another disk or machine with `btrfs send`/`receive` (`--send`): incremental, with its own retention at the target.
+- `--dry-run` to see what would be created, deleted, restored or sent without touching anything.
 - Nice CLI output to see the status and details of snapshots.
 
 # Known limitations

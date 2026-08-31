@@ -7,3 +7,5 @@ ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --create --kin
 ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --clean --kind monthly
 ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --create --kind monthly
 ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-home.toml --clean --kind monthly
+# To replicate the snapshots (see docs, Replication), add after each --create:
+# ExecStart=/usr/bin/rusnapshot -c /etc/rusnapshot/config-root.toml --send
