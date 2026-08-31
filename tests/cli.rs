@@ -3,7 +3,10 @@
 //! is needed.
 
 use {
-    rusnapshot::{database, structs::SnapshotRecord},
+    rusnapshot::{
+        database,
+        structs::{ReplicaRecord, SnapshotRecord},
+    },
     std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -14,14 +17,16 @@ use {
 
 const FAKE_BTRFS: &str = r#"#!/usr/bin/env bash
 # Fake btrfs: logs every invocation and simulates subvolumes with plain directories.
+# A subvolume is a directory holding a .uuid file; a received one also holds .received_uuid.
 LOG="${FAKE_BTRFS_LOG:?}"
 echo "btrfs $*" >> "$LOG"
 if [ -n "$FAKE_BTRFS_FAIL" ]; then echo "fake btrfs: forced failure" >&2; exit 1; fi
+newuuid() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/'; }
 sub="$1"; op="$2"; shift 2
 case "$sub/$op" in
   subvolume/create)
     [ -d "$(dirname "$1")" ] || { echo "ERROR: cannot access '$1'" >&2; exit 1; }
-    mkdir "$1" ;;
+    mkdir "$1" && newuuid > "$1/.uuid" ;;
   subvolume/snapshot)
     pos=()
     for a in "$@"; do [ "$a" = "-r" ] || pos+=("$a"); done
@@ -29,12 +34,64 @@ case "$sub/$op" in
     [ -d "$src" ] || { echo "ERROR: cannot access '$src'" >&2; exit 1; }
     if [ -d "$dst" ]; then dst="$dst/$(basename "$src")"; fi
     [ -d "$(dirname "$dst")" ] || { echo "ERROR: cannot access '$dst': No such file or directory" >&2; exit 1; }
-    mkdir "$dst" ;;
+    mkdir "$dst" && newuuid > "$dst/.uuid" ;;
   subvolume/delete)
     [ -d "$1" ] || { echo "ERROR: Not a Btrfs subvolume: $1" >&2; exit 1; }
     rm -rf "$1" ;;
+  filesystem/sync)
+    [ -d "$1" ] || { echo "ERROR: not a directory: $1" >&2; exit 1; } ;;
+  subvolume/show)
+    [ -f "$1/.uuid" ] || { echo "ERROR: Not a Btrfs subvolume: $1" >&2; exit 1; }
+    recv="-"; [ -f "$1/.received_uuid" ] && recv=$(cat "$1/.received_uuid")
+    printf '%s\n\tName: \t\t\t%s\n\tUUID: \t\t\t%s\n\tParent UUID: \t\t-\n\tReceived UUID: \t\t%s\n\tFlags: \t\t\treadonly\n' "$1" "$(basename "$1")" "$(cat "$1/.uuid")" "$recv" ;;
+  send/*)
+    set -- "$op" "$@"
+    parent="-"
+    if [ "$1" = "-p" ]; then parent=$(cat "$2/.uuid"); shift 2; fi
+    path="$1"
+    [ -f "$path/.uuid" ] || { echo "ERROR: not a subvolume: $path" >&2; exit 1; }
+    printf 'FAKE-BTRFS-STREAM name=%s uuid=%s parent=%s\n' "$(basename "$path")" "$(cat "$path/.uuid")" "$parent"
+    head -c "${FAKE_BTRFS_PAYLOAD:-1048576}" /dev/zero ;;
+  receive/*)
+    dir="$op"
+    header=$(head -n1); cat > /dev/null
+    name=${header#*name=}; name=${name%% *}
+    uuid=${header#*uuid=}; uuid=${uuid%% *}
+    parent=${header#*parent=}
+    [ -d "$dir" ] || { echo "ERROR: cannot access '$dir'" >&2; exit 1; }
+    [ -e "$dir/$name" ] && { echo "ERROR: creating snapshot $name: File exists" >&2; exit 1; }
+    if [ "$parent" != "-" ]; then
+      found=0
+      for d in "$dir"/*/; do [ -f "$d/.received_uuid" ] && [ "$(cat "$d/.received_uuid")" = "$parent" ] && found=1; done
+      [ $found = 1 ] || { echo "ERROR: cannot find parent subvolume" >&2; exit 1; }
+    fi
+    mkdir "$dir/$name" && newuuid > "$dir/$name/.uuid"
+    if [ -n "$FAKE_BTRFS_RECEIVE_FAIL" ]; then echo "ERROR: fake receive failure" >&2; exit 1; fi
+    echo "$uuid" > "$dir/$name/.received_uuid" ;;
   *) echo "fake btrfs: unsupported command: $sub $op $*" >&2; exit 1 ;;
 esac
+"#;
+
+const FAKE_SSH: &str = r#"#!/usr/bin/env bash
+# Fake ssh: logs the host and runs the remote command line locally.
+LOG="${FAKE_BTRFS_LOG:?}"
+host=""; cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; cmd="$*"; break ;;
+    -o|-p|-i|-F|-l) shift 2 ;;
+    -*) shift ;;
+    *) host="$1"; shift ;;
+  esac
+done
+echo "ssh $host: $cmd" >> "$LOG"
+exec bash -c "$cmd"
+"#;
+
+const FAKE_SUDO: &str = r#"#!/usr/bin/env bash
+# Fake sudo: runs the command as is.
+[ "$1" = "-n" ] && shift
+exec "$@"
 "#;
 
 struct Sandbox {
@@ -43,6 +100,8 @@ struct Sandbox {
     snaps: PathBuf,
     db: PathBuf,
     log: PathBuf,
+    /// Simulated replication target directory.
+    target: PathBuf,
 }
 
 impl Sandbox {
@@ -52,14 +111,22 @@ impl Sandbox {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::create_dir_all(dir.join("src")).unwrap();
-        let fake = dir.join("bin/btrfs");
-        fs::write(&fake, FAKE_BTRFS).unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, script) in [
+            ("btrfs", FAKE_BTRFS),
+            ("ssh", FAKE_SSH),
+            ("sudo", FAKE_SUDO),
+        ] {
+            let fake = dir.join("bin").join(name);
+            fs::write(&fake, script).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::create_dir_all(dir.join("target")).unwrap();
         Self {
             src: dir.join("src"),
             snaps: dir.join("snaps"),
             db: dir.join("snaps/db.sqlite"),
             log: dir.join("btrfs.log"),
+            target: dir.join("target"),
             dir,
         }
     }
@@ -123,7 +190,7 @@ impl Sandbox {
         };
         let mut names: Vec<String> = entries
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| !n.starts_with("db.sqlite"))
+            .filter(|n| !n.starts_with("db.sqlite") && !n.starts_with('.'))
             .collect();
         names.sort();
         names
@@ -131,6 +198,40 @@ impl Sandbox {
 
     fn log(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn replicas(&self) -> Vec<ReplicaRecord> {
+        let connection = sqlite::open(&self.db).unwrap();
+        database::list_replicas(&connection).unwrap()
+    }
+
+    fn target_str(&self) -> &str {
+        self.target.to_str().unwrap()
+    }
+
+    /// `--send` to the sandbox target directory as machine `test`.
+    fn send(&self, extra: &[&str]) -> Output {
+        let mut args = vec![
+            "--send",
+            "--target",
+            self.target_str(),
+            "-m",
+            "test",
+            "-d",
+            self.db_path(),
+        ];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
+    /// Names of the replicas present in the target directory.
+    fn replicas_on_disk(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.target)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     fn write(&self, name: &str, content: &str) -> String {
@@ -144,6 +245,17 @@ impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+fn read_trimmed(path: &Path) -> String {
+    fs::read_to_string(path).unwrap().trim().to_string()
+}
+
+/// The replica at `target/name` must have been received from the snapshot at `snaps/name`.
+fn assert_replica_matches(sb: &Sandbox, name: &str) {
+    let source_uuid = read_trimmed(&sb.snaps.join(name).join(".uuid"));
+    let received = read_trimmed(&sb.target.join(name).join(".received_uuid"));
+    assert_eq!(received, source_uuid, "{name}");
 }
 
 fn records_in(db: &Path) -> Vec<SnapshotRecord> {
@@ -245,7 +357,7 @@ fn create_with_relative_paths_and_rw() {
 }
 
 #[test]
-fn create_fails_loudly_when_btrfs_fails() {
+fn create_fails_with_nonzero_exit_when_btrfs_fails() {
     let sb = Sandbox::new("btrfs-fails");
     fs::create_dir_all(&sb.snaps).unwrap();
     let output = sb.run_env(
@@ -900,7 +1012,7 @@ fn list_on_missing_database_fails_without_creating_it() {
     assert!(!sb.db.exists());
     let output = sb.run(&["--clean", "-d", sb.db_path()]);
     assert_failed(&output, "does not exist");
-    // With --dry-run there is simply nothing to show.
+    // With --dry-run there is nothing to show.
     let output = sb.run(&["--clean", "--dry-run", "-d", sb.db_path()]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(!sb.db.exists());
@@ -932,6 +1044,10 @@ fn invalid_flag_combinations_are_rejected() {
         &["--restore"],
         &["--restore", "--id", "x", "--from", "/somewhere"],
         &["--del", "--id", "x", "--to", "/somewhere"],
+        &["--target", "/x", "--list"],
+        &["--send", "--create"],
+        &["--send", "--clean"],
+        &["--send", "--to", "/x"],
     ];
     for case in cases {
         let mut args = case.to_vec();
@@ -1015,4 +1131,508 @@ fn hostname_is_used_when_no_machine_is_given() {
     let output = sb.run(&["--clean", "--keep", "0", "-d", sb.db_path()]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(sb.records().is_empty());
+}
+
+#[test]
+fn send_full_then_incremental_to_a_local_target() {
+    let sb = Sandbox::new("send-local");
+    sb.create(&["--prefix", "p", "--kind", "k"]);
+    let first = sb.records().remove(0);
+
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains(&format!(
+            "Sending {} to {} (full send)",
+            first.name,
+            sb.target_str()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("Sent "), "{out}");
+    assert_replica_matches(&sb, &first.name);
+    let replicas = sb.replicas();
+    assert_eq!(replicas.len(), 1);
+    assert_eq!(replicas[0].name, first.name);
+    assert_eq!(replicas[0].target, sb.target_str());
+    assert_eq!(replicas[0].parent_name, None);
+    assert_eq!(replicas[0].kind, "k");
+    assert_eq!(replicas[0].machine, "test");
+    assert_eq!(replicas[0].local_path, first.path());
+    assert!(
+        sb.log().contains(&format!("btrfs send {}\n", first.path())),
+        "{}",
+        sb.log()
+    );
+    assert!(
+        sb.log()
+            .contains(&format!("btrfs receive {}\n", sb.target_str())),
+        "{}",
+        sb.log()
+    );
+
+    // Second snapshot: incremental from the first one. Nothing is sent twice.
+    sb.create(&["--prefix", "p", "--kind", "k"]);
+    let second = sb
+        .records()
+        .into_iter()
+        .find(|r| r.name != first.name)
+        .unwrap();
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!("incremental from {}", first.name)),
+        "{}",
+        text(&output)
+    );
+    assert_replica_matches(&sb, &second.name);
+    assert!(
+        sb.log().contains(&format!(
+            "btrfs send -p {} {}\n",
+            first.path(),
+            second.path()
+        )),
+        "{}",
+        sb.log()
+    );
+    assert_eq!(sb.log().matches("btrfs send").count(), 2);
+    let replicas = sb.replicas();
+    assert_eq!(replicas.len(), 2);
+    let second_replica = replicas.iter().find(|r| r.name == second.name).unwrap();
+    assert_eq!(
+        second_replica.parent_name.as_deref(),
+        Some(first.name.as_str())
+    );
+
+    // Nothing pending: no send at all.
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("Nothing to send"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(sb.log().matches("btrfs send").count(), 2);
+}
+
+#[test]
+fn send_over_ssh_with_port_runs_btrfs_through_sudo() {
+    let sb = Sandbox::new("send-ssh");
+    sb.create(&[]);
+    let record = sb.records().remove(0);
+    let url = format!("ssh://backup@nas:2222{}", sb.target_str());
+
+    let output = sb.run(&["--send", "--target", &url, "-m", "test", "-d", sb.db_path()]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_replica_matches(&sb, &record.name);
+    let log = sb.log();
+    assert!(
+        log.contains(&format!(
+            "ssh backup@nas: sh -c 'test -e {} && echo yes || echo no'
+",
+            sb.target_str()
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "ssh backup@nas: sudo -n btrfs receive {}\n",
+            sb.target_str()
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "ssh backup@nas: sudo -n btrfs subvolume show {}/{}\n",
+            sb.target_str(),
+            record.name
+        )),
+        "{log}"
+    );
+    assert_eq!(sb.replicas()[0].target, url);
+}
+
+#[test]
+fn send_dry_run_touches_nothing() {
+    let sb = Sandbox::new("send-dry-run");
+    sb.create(&["--prefix", "p"]);
+    let record = sb.records().remove(0);
+    let output = sb.send(&["--prefix", "p", "--dry-run"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!(
+            "[dry-run] would send {} to {} (full send)",
+            record.name,
+            sb.target_str()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert!(sb.replicas_on_disk().is_empty());
+    assert!(sb.replicas().is_empty());
+    assert!(!sb.log().contains("btrfs send"));
+    // A missing target directory is fine for a dry run.
+    let output = sb.run(&[
+        "--send",
+        "--target",
+        "/nonexistent/target",
+        "--dry-run",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+}
+
+#[test]
+fn send_skips_rw_snapshots_and_other_machines() {
+    let sb = Sandbox::new("send-rw");
+    sb.create(&["--prefix", "p", "--rw"]);
+    sb.create(&["--prefix", "p", "--machine", "other"]);
+    sb.create(&["--prefix", "q"]);
+    sb.create(&["--prefix", "p"]);
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let replicas = sb.replicas();
+    assert_eq!(replicas.len(), 1, "{replicas:?}");
+    assert_eq!(replicas[0].machine, "test");
+    assert!(replicas[0].name.starts_with("p-"));
+    let record = sb
+        .records()
+        .into_iter()
+        .find(|r| r.name == replicas[0].name)
+        .unwrap();
+    assert_eq!(record.ro_rw, "false");
+}
+
+#[test]
+fn send_failure_removes_the_partial_replica_and_a_retry_succeeds() {
+    let sb = Sandbox::new("send-failure");
+    sb.create(&["--prefix", "p"]);
+    let record = sb.records().remove(0);
+
+    let output = sb.run_env(
+        &[
+            "--send",
+            "--target",
+            sb.target_str(),
+            "-m",
+            "test",
+            "-d",
+            sb.db_path(),
+            "--prefix",
+            "p",
+        ],
+        &[("FAKE_BTRFS_RECEIVE_FAIL", "1")],
+    );
+    assert_failed(&output, "btrfs receive");
+    assert!(
+        stderr(&output).contains("Removing the incomplete replica"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        sb.replicas_on_disk().is_empty(),
+        "{:?}",
+        sb.replicas_on_disk()
+    );
+    assert!(sb.replicas().is_empty());
+    assert!(
+        sb.log().contains(&format!(
+            "btrfs subvolume delete {}/{}\n",
+            sb.target_str(),
+            record.name
+        )),
+        "{}",
+        sb.log()
+    );
+
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_replica_matches(&sb, &record.name);
+    assert_eq!(sb.replicas().len(), 1);
+
+    // btrfs send itself failing is reported too.
+    sb.create(&["--prefix", "p"]);
+    let output = sb.run_env(
+        &[
+            "--send",
+            "--target",
+            sb.target_str(),
+            "-m",
+            "test",
+            "-d",
+            sb.db_path(),
+            "--prefix",
+            "p",
+        ],
+        &[("FAKE_BTRFS_FAIL", "1")],
+    );
+    assert!(!output.status.success(), "{}", text(&output));
+    assert_eq!(sb.replicas().len(), 1);
+}
+
+#[test]
+fn send_adopts_replicas_already_present_at_the_target() {
+    let sb = Sandbox::new("send-adopt");
+    sb.create(&["--prefix", "p"]);
+    let record = sb.records().remove(0);
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    {
+        let connection = sqlite::open(&sb.db).unwrap();
+        connection.execute("DELETE FROM replicas").unwrap();
+    }
+    assert!(sb.replicas().is_empty());
+
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!(
+            "{} is already present at {}",
+            record.name,
+            sb.target_str()
+        )),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        sb.log().matches("btrfs send").count(),
+        1,
+        "nothing must be sent again"
+    );
+    assert_eq!(sb.replicas().len(), 1);
+
+    // A subvolume with the right name but the wrong content is replaced.
+    fs::write(
+        sb.target.join(&record.name).join(".received_uuid"),
+        "not-the-source\n",
+    )
+    .unwrap();
+    {
+        let connection = sqlite::open(&sb.db).unwrap();
+        connection.execute("DELETE FROM replicas").unwrap();
+    }
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stderr(&output).contains("is not a complete replica"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(sb.log().matches("btrfs send").count(), 2);
+    assert_replica_matches(&sb, &record.name);
+}
+
+#[test]
+fn send_falls_back_to_an_older_parent_when_the_newest_is_gone_from_the_target() {
+    let sb = Sandbox::new("send-parent-gone");
+    sb.create(&["--prefix", "p"]);
+    assert!(sb.send(&["--prefix", "p"]).status.success());
+    sb.create(&["--prefix", "p"]);
+    assert!(sb.send(&["--prefix", "p"]).status.success());
+    let mut names: Vec<String> = sb.records().into_iter().map(|r| r.name).collect();
+    names.sort();
+    let (first, second) = (names[0].clone(), names[1].clone());
+    fs::remove_dir_all(sb.target.join(&second)).unwrap();
+
+    sb.create(&["--prefix", "p"]);
+    let third = sb.records().into_iter().map(|r| r.name).max().unwrap();
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stderr(&output).contains(&format!("{second} is no longer present")),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!("incremental from {first}")),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        sb.log().contains(&format!(
+            "btrfs send -p {}/{first} {}/{third}\n",
+            sb.snaps.display(),
+            sb.snaps.display()
+        )),
+        "{}",
+        sb.log()
+    );
+    let mut replicated: Vec<String> = sb.replicas().into_iter().map(|r| r.name).collect();
+    replicated.sort();
+    assert_eq!(replicated, [first.clone(), third.clone()]);
+
+    // The forgotten one is pending again and gets re-sent on the next run.
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!("Sending {second}")),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(sb.replicas().len(), 3);
+    assert_replica_matches(&sb, &second);
+}
+
+#[test]
+fn send_prunes_the_target_per_kind_with_keep_from_the_config() {
+    let sb = Sandbox::new("send-prune");
+    let config = sb.write(
+        "config.toml",
+        &format!(
+            "dest_dir = \"{}\"\nsource_dir = \"{}\"\ndatabase_file = \"{}\"\nsnapshot_prefix = \"p\"\nmachine = \"test\"\n\n[[replicate]]\ntarget = \"{}\"\nkeep = 2\n",
+            sb.snaps.display(),
+            sb.src.display(),
+            sb.db.display(),
+            sb.target.display()
+        ),
+    );
+    for _ in 0..3 {
+        let output = sb.run(&["-c", &config, "--create", "--kind", "k"]);
+        assert!(output.status.success(), "{}", text(&output));
+    }
+    let output = sb.run(&["-c", &config, "--create", "--kind", "other"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let mut k_names: Vec<String> = sb
+        .records()
+        .into_iter()
+        .filter(|r| r.kind == "k")
+        .map(|r| r.name)
+        .collect();
+    k_names.sort();
+
+    let output = sb.run(&["-c", &config, "--send", "--dry-run"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        stdout(&output).matches("would send").count(),
+        4,
+        "{}",
+        text(&output)
+    );
+    assert!(sb.replicas_on_disk().is_empty());
+
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let out = stdout(&output);
+    assert_eq!(out.matches("Sent ").count(), 4, "{out}");
+    assert!(
+        out.contains(&format!(
+            "Deleted replica {} at {} (keeping the last 2 'k' replicas)",
+            k_names[0],
+            sb.target_str()
+        )),
+        "{out}"
+    );
+    let mut expected: Vec<String> = k_names[1..].to_vec();
+    expected.push(
+        sb.records()
+            .into_iter()
+            .find(|r| r.kind == "other")
+            .unwrap()
+            .name,
+    );
+    expected.sort();
+    assert_eq!(sb.replicas_on_disk(), expected);
+    assert_eq!(sb.replicas().len(), 3);
+    // Local snapshots are not touched by the remote retention.
+    assert_eq!(sb.records().len(), 4);
+
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("Nothing to send"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !stdout(&output).contains("Deleted replica"),
+        "{}",
+        text(&output)
+    );
+}
+
+#[test]
+fn send_requires_a_target_and_an_existing_target_directory() {
+    let sb = Sandbox::new("send-errors");
+    sb.create(&[]);
+    let output = sb.run(&["--send", "-m", "test", "-d", sb.db_path()]);
+    assert_failed(&output, "no replication target");
+    let output = sb.run(&[
+        "--send",
+        "--target",
+        "/nonexistent/target",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert_failed(&output, "does not exist");
+    let output = sb.run(&[
+        "--send",
+        "--target",
+        "relative/dir",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert_failed(&output, "unsupported replication target");
+    assert!(sb.replicas().is_empty());
+    assert!(!sb.log().contains("btrfs send"));
+}
+
+#[test]
+fn list_shows_replicas() {
+    let sb = Sandbox::new("list-replicas");
+    sb.create(&["--prefix", "p"]);
+    assert!(sb.send(&["--prefix", "p"]).status.success());
+    let record = sb.records().remove(0);
+    let output = sb.run(&["--list", "-d", sb.db_path()]);
+    assert!(output.status.success(), "{}", text(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Replicas:"), "{out}");
+    assert!(out.contains(sb.target_str()), "{out}");
+    assert_eq!(out.matches(&record.name).count(), 2, "{out}");
+}
+
+#[test]
+fn send_syncs_the_target_filesystem_after_receiving() {
+    let sb = Sandbox::new("send-sync");
+    sb.create(&["--prefix", "p"]);
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let log = sb.log();
+    let receive = log
+        .find(&format!("btrfs receive {}\n", sb.target_str()))
+        .unwrap();
+    let sync = log
+        .find(&format!("btrfs filesystem sync {}\n", sb.target_str()))
+        .unwrap();
+    assert!(receive < sync, "{log}");
+
+    let url = format!("ssh://backup@nas{}", sb.target_str());
+    sb.create(&["--prefix", "q"]);
+    let output = sb.run(&[
+        "--send",
+        "--target",
+        &url,
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+        "--prefix",
+        "q",
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        sb.log().contains(&format!(
+            "ssh backup@nas: sudo -n btrfs filesystem sync {}\n",
+            sb.target_str()
+        )),
+        "{}",
+        sb.log()
+    );
 }

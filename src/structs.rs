@@ -29,6 +29,27 @@ impl SnapshotRecord {
     }
 }
 
+/// A replica of a snapshot at a replication target, as tracked in the `replicas` table.
+///
+/// It carries its own copy of the snapshot metadata so it stays usable after the local
+/// snapshot has been cleaned up.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReplicaRecord {
+    pub name: String,
+    pub snap_id: String,
+    /// Target URL as written in the configuration.
+    pub target: String,
+    pub local_path: String,
+    pub source: String,
+    pub kind: String,
+    pub machine: String,
+    /// Creation date of the snapshot (UTC, as stored in `snapshots.date`).
+    pub snapshot_date: String,
+    /// Snapshot used as parent for the incremental send, if any.
+    pub parent_name: Option<String>,
+    pub date: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::SnapshotRecord;

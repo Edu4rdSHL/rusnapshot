@@ -1,12 +1,16 @@
 use {
-    crate::{args::Args, structs::SnapshotRecord},
+    crate::{
+        args::Args,
+        structs::{ReplicaRecord, SnapshotRecord},
+    },
     anyhow::{Context, Result, bail},
     sqlite::{Connection, State, Statement},
-    std::path::Path,
+    std::{collections::HashSet, path::Path},
 };
 
 const SELECT_COLUMNS: &str =
     "name, snap_id, kind, source, destination, machine, ro_rw, datetime(date, 'localtime')";
+const REPLICA_COLUMNS: &str = "name, snap_id, target, local_path, source, kind, machine, snapshot_date, parent_name, datetime(date, 'localtime')";
 const QUOTED_MACHINE: &str =
     "length(machine) >= 2 AND substr(machine, 1, 1) = '\"' AND substr(machine, -1, 1) = '\"'";
 
@@ -67,20 +71,26 @@ pub fn open(args: &Args) -> Result<Connection> {
 ///
 /// Fails on any `SQLite` error.
 pub fn setup_initial_database(connection: &Connection) -> Result<()> {
-    if !table_exists(connection)? {
+    if !table_exists(connection, "snapshots")? {
         connection.execute(
             "CREATE TABLE snapshots (name TEXT NOT NULL, snap_id TEXT NOT NULL, kind TEXT NOT NULL, source TEXT NOT NULL, destination TEXT NOT NULL, machine TEXT NOT NULL, ro_rw TEXT NOT NULL, date TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(name, snap_id))",
         )?;
         connection.execute("PRAGMA journal_mode=WAL")?;
+    }
+    if !table_exists(connection, "replicas")? {
+        connection.execute(
+            "CREATE TABLE replicas (name TEXT NOT NULL, snap_id TEXT NOT NULL, target TEXT NOT NULL, local_path TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL, machine TEXT NOT NULL, snapshot_date TEXT NOT NULL, parent_name TEXT, date TEXT DEFAULT CURRENT_TIMESTAMP, pruned TEXT, PRIMARY KEY(name, snap_id, target))",
+        )?;
     }
     migrate_quoted_machines(connection)?;
 
     Ok(())
 }
 
-fn table_exists(connection: &Connection) -> Result<bool> {
-    let mut statement = connection
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'")?;
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    let mut statement =
+        connection.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    statement.bind((1, table))?;
 
     Ok(statement.next()? == State::Row)
 }
@@ -197,6 +207,209 @@ pub fn cleanup_candidates(
     collect(&mut statement)
 }
 
+/// Read-only snapshots of this prefix (`LIKE 'prefix%'`) and machine, oldest first, with the
+/// raw UTC date so it can be copied into the replicas table.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn pending_replication(
+    connection: &Connection,
+    prefix: &str,
+    machine: &str,
+) -> Result<Vec<SnapshotRecord>> {
+    let pattern = format!("{prefix}%");
+    let mut statement = connection.prepare(
+        "SELECT name, snap_id, kind, source, destination, machine, ro_rw, date FROM snapshots WHERE name LIKE ?1 AND machine = ?2 AND ro_rw = 'false' ORDER BY date ASC, name ASC",
+    )?;
+    statement.bind((1, pattern.as_str()))?;
+    statement.bind((2, machine))?;
+
+    collect(&mut statement)
+}
+
+/// Record a verified replica.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn insert_replica(connection: &Connection, replica: &ReplicaRecord) -> Result<()> {
+    let mut statement = connection.prepare(
+        "INSERT OR REPLACE INTO replicas (name, snap_id, target, local_path, source, kind, machine, snapshot_date, parent_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    statement.bind((1, replica.name.as_str()))?;
+    statement.bind((2, replica.snap_id.as_str()))?;
+    statement.bind((3, replica.target.as_str()))?;
+    statement.bind((4, replica.local_path.as_str()))?;
+    statement.bind((5, replica.source.as_str()))?;
+    statement.bind((6, replica.kind.as_str()))?;
+    statement.bind((7, replica.machine.as_str()))?;
+    statement.bind((8, replica.snapshot_date.as_str()))?;
+    statement.bind((9, replica.parent_name.as_deref()))?;
+    statement.next()?;
+
+    Ok(())
+}
+
+/// Mark a replica as deleted from the target by the remote retention. The row stays so the
+/// snapshot is not sent again; it only stops being a parent candidate.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn mark_replica_pruned(connection: &Connection, replica: &ReplicaRecord) -> Result<()> {
+    let mut statement = connection.prepare(
+        "UPDATE replicas SET pruned = CURRENT_TIMESTAMP WHERE name = ?1 AND snap_id = ?2 AND target = ?3",
+    )?;
+    statement.bind((1, replica.name.as_str()))?;
+    statement.bind((2, replica.snap_id.as_str()))?;
+    statement.bind((3, replica.target.as_str()))?;
+    statement.next()?;
+
+    Ok(())
+}
+
+/// Forget a replica completely, so the snapshot becomes pending again.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn delete_replica(connection: &Connection, replica: &ReplicaRecord) -> Result<()> {
+    let mut statement = connection
+        .prepare("DELETE FROM replicas WHERE name = ?1 AND snap_id = ?2 AND target = ?3")?;
+    statement.bind((1, replica.name.as_str()))?;
+    statement.bind((2, replica.snap_id.as_str()))?;
+    statement.bind((3, replica.target.as_str()))?;
+    statement.next()?;
+
+    Ok(())
+}
+
+/// Names of the snapshots already replicated to `target`, including the replicas that the
+/// remote retention deleted since (they must not be sent again).
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn replicated_names(connection: &Connection, target: &str) -> Result<HashSet<String>> {
+    let mut statement = connection.prepare("SELECT name FROM replicas WHERE target = ?1")?;
+    statement.bind((1, target))?;
+    let mut names = HashSet::new();
+    while statement.next()? == State::Row {
+        names.insert(statement.read::<String, _>(0)?);
+    }
+
+    Ok(names)
+}
+
+/// Replicas present at `target` of the same source subvolume and machine, newest snapshot
+/// first: the candidates to be the parent of an incremental send.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn parent_candidates(
+    connection: &Connection,
+    target: &str,
+    source: &str,
+    machine: &str,
+) -> Result<Vec<ReplicaRecord>> {
+    let mut statement = connection.prepare(format!(
+        "SELECT {REPLICA_COLUMNS} FROM replicas WHERE target = ?1 AND source = ?2 AND machine = ?3 AND pruned IS NULL ORDER BY snapshot_date DESC, name DESC"
+    ))?;
+    statement.bind((1, target))?;
+    statement.bind((2, source))?;
+    statement.bind((3, machine))?;
+
+    collect_replicas(&mut statement)
+}
+
+/// Kinds of the replicas present at `target` for this prefix and machine.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn replica_kinds(
+    connection: &Connection,
+    target: &str,
+    prefix: &str,
+    machine: &str,
+) -> Result<Vec<String>> {
+    let pattern = format!("{prefix}%");
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT kind FROM replicas WHERE target = ?1 AND name LIKE ?2 AND machine = ?3 AND pruned IS NULL ORDER BY kind",
+    )?;
+    statement.bind((1, target))?;
+    statement.bind((2, pattern.as_str()))?;
+    statement.bind((3, machine))?;
+    let mut kinds = Vec::new();
+    while statement.next()? == State::Row {
+        kinds.push(statement.read::<String, _>(0)?);
+    }
+
+    Ok(kinds)
+}
+
+/// Replicas present at `target` beyond the newest `keep` ones of this prefix, kind and machine.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn remote_prune_candidates(
+    connection: &Connection,
+    target: &str,
+    prefix: &str,
+    kind: &str,
+    machine: &str,
+    keep: usize,
+) -> Result<Vec<ReplicaRecord>> {
+    let pattern = format!("{prefix}%");
+    let keep = i64::try_from(keep).context("keep is too large")?;
+    let mut statement = connection.prepare(format!(
+        "SELECT {REPLICA_COLUMNS} FROM (SELECT row_number() OVER (ORDER BY snapshot_date DESC, name DESC) AS n, * FROM replicas WHERE target = ?1 AND name LIKE ?2 AND kind = ?3 AND machine = ?4 AND pruned IS NULL) WHERE n > ?5 ORDER BY snapshot_date ASC, name ASC"
+    ))?;
+    statement.bind((1, target))?;
+    statement.bind((2, pattern.as_str()))?;
+    statement.bind((3, kind))?;
+    statement.bind((4, machine))?;
+    statement.bind((5, keep))?;
+
+    collect_replicas(&mut statement)
+}
+
+/// Every replica present at its target, newest first.
+///
+/// # Errors
+///
+/// Fails on any `SQLite` error.
+pub fn list_replicas(connection: &Connection) -> Result<Vec<ReplicaRecord>> {
+    let mut statement = connection.prepare(format!(
+        "SELECT {REPLICA_COLUMNS} FROM replicas WHERE pruned IS NULL ORDER BY snapshot_date DESC, name DESC, target"
+    ))?;
+
+    collect_replicas(&mut statement)
+}
+
+fn collect_replicas(statement: &mut Statement) -> Result<Vec<ReplicaRecord>> {
+    let mut replicas = Vec::new();
+    while statement.next()? == State::Row {
+        replicas.push(ReplicaRecord {
+            name: statement.read(0)?,
+            snap_id: statement.read(1)?,
+            target: statement.read(2)?,
+            local_path: statement.read(3)?,
+            source: statement.read(4)?,
+            kind: statement.read(5)?,
+            machine: statement.read(6)?,
+            snapshot_date: statement.read(7)?,
+            parent_name: statement.read::<Option<String>, _>(8)?,
+            date: statement.read::<Option<String>, _>(9)?.unwrap_or_default(),
+        });
+    }
+
+    Ok(replicas)
+}
+
 fn collect(statement: &mut Statement) -> Result<Vec<SnapshotRecord>> {
     let mut records = Vec::new();
     while statement.next()? == State::Row {
@@ -223,10 +436,12 @@ fn read_record(statement: &Statement) -> Result<SnapshotRecord> {
 mod tests {
     use {
         super::{
-            cleanup_candidates, delete_snapshot, find_snapshots, insert_snapshot, list_all,
+            cleanup_candidates, delete_replica, delete_snapshot, find_snapshots, insert_replica,
+            insert_snapshot, list_all, list_replicas, mark_replica_pruned, parent_candidates,
+            pending_replication, remote_prune_candidates, replica_kinds, replicated_names,
             setup_initial_database,
         },
-        crate::structs::SnapshotRecord,
+        crate::structs::{ReplicaRecord, SnapshotRecord},
         sqlite::Connection,
     };
 
@@ -480,6 +695,183 @@ mod tests {
         );
         let daily_b = cleanup_candidates(&connection, "root", "daily", false, "B", 1).unwrap();
         assert_eq!(names(&daily_b), ["root-4"]);
+    }
+
+    fn replica(
+        name: &str,
+        target: &str,
+        kind: &str,
+        date: &str,
+        parent: Option<&str>,
+    ) -> ReplicaRecord {
+        ReplicaRecord {
+            name: name.into(),
+            snap_id: format!("id-{name}"),
+            target: target.into(),
+            local_path: format!("/.snapshots/{name}"),
+            source: "/home/".into(),
+            kind: kind.into(),
+            machine: "h".into(),
+            snapshot_date: date.into(),
+            parent_name: parent.map(str::to_string),
+            date: String::new(),
+        }
+    }
+
+    #[test]
+    fn pending_replication_is_ro_only_and_oldest_first() {
+        let connection = db();
+        insert(
+            &connection,
+            "root-2",
+            "daily",
+            "h",
+            false,
+            "2026-01-02 00:00:00",
+        );
+        insert(
+            &connection,
+            "root-1",
+            "daily",
+            "h",
+            false,
+            "2026-01-01 00:00:00",
+        );
+        insert(
+            &connection,
+            "root-3",
+            "daily",
+            "h",
+            true,
+            "2026-01-03 00:00:00",
+        );
+        insert(
+            &connection,
+            "root-4",
+            "daily",
+            "other",
+            false,
+            "2026-01-04 00:00:00",
+        );
+        insert(
+            &connection,
+            "home-1",
+            "daily",
+            "h",
+            false,
+            "2026-01-05 00:00:00",
+        );
+        let pending = pending_replication(&connection, "root", "h").unwrap();
+        assert_eq!(names(&pending), ["root-1", "root-2"]);
+        // Raw UTC date, not converted to local time.
+        assert_eq!(pending[0].date, "2026-01-01 00:00:00");
+    }
+
+    #[test]
+    fn replica_queries() {
+        let connection = db();
+        let nas = "ssh://nas/srv";
+        insert_replica(
+            &connection,
+            &replica("root-1", nas, "daily", "2026-01-01 00:00:00", None),
+        )
+        .unwrap();
+        insert_replica(
+            &connection,
+            &replica(
+                "root-2",
+                nas,
+                "daily",
+                "2026-01-02 00:00:00",
+                Some("root-1"),
+            ),
+        )
+        .unwrap();
+        insert_replica(
+            &connection,
+            &replica(
+                "root-3",
+                nas,
+                "weekly",
+                "2026-01-03 00:00:00",
+                Some("root-2"),
+            ),
+        )
+        .unwrap();
+        insert_replica(
+            &connection,
+            &replica("root-4", "/mnt/usb", "daily", "2026-01-04 00:00:00", None),
+        )
+        .unwrap();
+        insert_replica(
+            &connection,
+            &replica("home-1", nas, "daily", "2026-01-05 00:00:00", None),
+        )
+        .unwrap();
+
+        let names_at_nas = replicated_names(&connection, nas).unwrap();
+        assert_eq!(names_at_nas.len(), 4);
+        assert!(names_at_nas.contains("root-3") && !names_at_nas.contains("root-4"));
+
+        let parents = parent_candidates(&connection, nas, "/home/", "h").unwrap();
+        let parent_names: Vec<&str> = parents.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(parent_names, ["home-1", "root-3", "root-2", "root-1"]);
+        assert_eq!(parents[1].parent_name.as_deref(), Some("root-2"));
+        assert!(parents[3].parent_name.is_none());
+        assert!(
+            parent_candidates(&connection, nas, "/other/", "h")
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            replica_kinds(&connection, nas, "root", "h").unwrap(),
+            ["daily", "weekly"]
+        );
+        let prune = remote_prune_candidates(&connection, nas, "root", "daily", "h", 1).unwrap();
+        assert_eq!(prune.len(), 1);
+        assert_eq!(prune[0].name, "root-1");
+        assert!(
+            remote_prune_candidates(&connection, nas, "root", "weekly", "h", 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Re-recording an existing replica replaces it instead of failing.
+        insert_replica(
+            &connection,
+            &replica("root-1", nas, "daily", "2026-01-01 00:00:00", None),
+        )
+        .unwrap();
+        // Pruned replicas stay recorded, so they are not sent again, but stop being parents.
+        assert_eq!(list_replicas(&connection).unwrap().len(), 5);
+        mark_replica_pruned(&connection, &prune[0]).unwrap();
+        assert!(
+            replicated_names(&connection, nas)
+                .unwrap()
+                .contains("root-1")
+        );
+        assert!(
+            parent_candidates(&connection, nas, "/home/", "h")
+                .unwrap()
+                .iter()
+                .all(|r| r.name != "root-1")
+        );
+        assert!(
+            remote_prune_candidates(&connection, nas, "root", "daily", "h", 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(list_replicas(&connection).unwrap().len(), 4);
+        assert!(!list_replicas(&connection).unwrap()[0].date.is_empty());
+        // Forgetting a replica removes it completely, so its snapshot is pending again.
+        delete_replica(&connection, &prune[0]).unwrap();
+        assert!(
+            !replicated_names(&connection, nas)
+                .unwrap()
+                .contains("root-1")
+        );
+        assert_eq!(list_replicas(&connection).unwrap().len(), 4);
     }
 
     #[test]

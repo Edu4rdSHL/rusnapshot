@@ -1,6 +1,6 @@
 use {
     anyhow::Result,
-    rusnapshot::{args::Args, controller, database, operations},
+    rusnapshot::{args::Args, controller, database, operations, replication},
 };
 
 fn try_run() -> Result<()> {
@@ -25,6 +25,9 @@ fn try_run() -> Result<()> {
     }
     if args.restore_snapshot {
         controller::manage_restoring(&args, &connection)?;
+    }
+    if args.send_snapshots {
+        replication::manage_sending(&args, &connection)?;
     }
     // Listing goes last so that combined with --clean it shows the resulting state.
     if args.list_snapshots {

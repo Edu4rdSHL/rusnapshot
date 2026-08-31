@@ -1,6 +1,9 @@
 use {
     crate::{
-        args::Args, database, operations, structs::SnapshotRecord, utils::strip_trailing_slash,
+        args::Args,
+        database, operations,
+        structs::{ReplicaRecord, SnapshotRecord},
+        utils::strip_trailing_slash,
     },
     anyhow::{Context, Result, bail},
     chrono::Utc,
@@ -125,6 +128,11 @@ pub fn manage_listing(connection: &Connection) -> Result<()> {
         println!("No snapshots are tracked in the database.");
     } else {
         print_table(&records);
+    }
+    let replicas = database::list_replicas(connection)?;
+    if !replicas.is_empty() {
+        println!("\nReplicas:");
+        print_replicas(&replicas);
     }
 
     Ok(())
@@ -254,6 +262,29 @@ fn delete_record(args: &Args, connection: &Connection, record: &SnapshotRecord) 
     }
 
     Ok(())
+}
+
+fn print_replicas(replicas: &[ReplicaRecord]) {
+    let mut table = Table::new();
+    table.set_titles(row![
+        bcFg => "NAME",
+        "TARGET",
+        "KIND",
+        "MACHINE",
+        "PARENT",
+        "REPLICATED"
+    ]);
+    for replica in replicas {
+        table.add_row(row![ d =>
+            replica.name,
+            replica.target,
+            replica.kind,
+            replica.machine,
+            replica.parent_name.as_deref().unwrap_or("-"),
+            replica.date,
+        ]);
+    }
+    table.printstd();
 }
 
 fn print_table(records: &[SnapshotRecord]) {

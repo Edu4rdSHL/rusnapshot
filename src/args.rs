@@ -1,5 +1,5 @@
 use {
-    crate::utils,
+    crate::{replication::Replication, utils},
     anyhow::{Context, Result, bail},
     clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, parser::ValueSource},
     serde::Deserialize,
@@ -13,10 +13,10 @@ pub struct Args {
     #[arg(short = 'c', long = "config")]
     pub config_file: Option<String>,
     /// Directory where snapshots should be saved. With --restore, directory where the snapshot will be restored (must not exist).
-    #[arg(long = "to", default_value = "", conflicts_with_all = ["delete_snapshot", "clean_snapshots"])]
+    #[arg(long = "to", default_value = "", conflicts_with_all = ["delete_snapshot", "clean_snapshots", "send_snapshots"])]
     pub dest_dir: String,
     /// Directory (subvolume) from where snapshots should be created.
-    #[arg(long = "from", default_value = "", conflicts_with_all = ["restore_snapshot", "delete_snapshot", "clean_snapshots"])]
+    #[arg(long = "from", default_value = "", conflicts_with_all = ["restore_snapshot", "delete_snapshot", "clean_snapshots", "send_snapshots"])]
     pub source_dir: String,
     /// Snapshot id or name to work with.
     #[arg(long = "id", default_value = "")]
@@ -72,9 +72,19 @@ pub struct Args {
     /// Machine name to be used in the metadata and to select the snapshots to clean. Defaults to the hostname.
     #[arg(short, long, default_value = "")]
     pub machine: String,
-    /// Show what would be created, deleted or restored without doing it.
+    /// Replicate the read-only snapshots of this prefix and machine to the replication targets with btrfs send/receive.
+    /// Targets come from the replicate sections of the configuration file or from --target.
+    #[arg(long = "send", group = "operation")]
+    pub send_snapshots: bool,
+    /// Replication target for --send, instead of the configuration file ones: an absolute path or ssh://user@host:port/path (user and port are optional).
+    #[arg(long = "target", requires = "send_snapshots", conflicts_with_all = ["create_snapshot", "delete_snapshot", "restore_snapshot", "clean_snapshots"])]
+    pub target: Option<String>,
+    /// Show what would be created, deleted, restored or sent without doing it.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+    /// Replication targets, from the configuration file or --target.
+    #[arg(skip)]
+    pub replicate: Vec<ReplicateConfig>,
 }
 
 impl Args {
@@ -98,12 +108,21 @@ impl Args {
         let mut args = Self::from_arg_matches(matches)?;
         if let Some(path) = args.config_file.clone() {
             let config = Config::from_file(&path)?;
+            // Options that only exist in the file (such as `replicate`) have no clap id.
             config.merge_into(&mut args, |id| {
-                matches!(
-                    matches.value_source(id),
-                    Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-                )
+                matches.try_contains_id(id).is_ok()
+                    && matches!(
+                        matches.value_source(id),
+                        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                    )
             });
+        }
+        if let Some(target) = &args.target {
+            args.replicate = vec![ReplicateConfig {
+                target: target.clone(),
+                keep: None,
+                ssh_options: Vec::new(),
+            }];
         }
 
         Ok(args)
@@ -130,6 +149,9 @@ impl Args {
         }
         if self.database_file.is_empty() {
             bail!("the database file path (-d/--dfile) must not be empty");
+        }
+        for config in &self.replicate {
+            Replication::from_config(config)?;
         }
 
         Ok(())
@@ -162,10 +184,23 @@ pub struct Config {
     pub keep_only: Option<usize>,
     pub timeout: Option<usize>,
     pub machine: Option<String>,
+    pub replicate: Option<Vec<ReplicateConfig>>,
+}
+
+/// One `[[replicate]]` section: where to send the snapshots with `--send`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReplicateConfig {
+    /// Absolute path or `ssh://[user@]host[:port]/path`.
+    pub target: String,
+    /// Replicas to keep per kind at the target. Unset means never delete anything there.
+    pub keep: Option<usize>,
+    /// Extra `ssh` options, for example `["-i", "/root/.ssh/backup_key"]`.
+    #[serde(default)]
+    pub ssh_options: Vec<String>,
 }
 
 impl Config {
-    pub const KNOWN_KEYS: [&'static str; 8] = [
+    pub const KNOWN_KEYS: [&'static str; 9] = [
         "dest_dir",
         "source_dir",
         "snapshot_prefix",
@@ -174,6 +209,7 @@ impl Config {
         "keep_only",
         "timeout",
         "machine",
+        "replicate",
     ];
 
     /// Read and parse a configuration file.
@@ -225,13 +261,14 @@ impl Config {
         apply!(keep_only);
         apply!(timeout);
         apply!(machine);
+        apply!(replicate);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use {
-        super::{Args, Config},
+        super::{Args, Config, ReplicateConfig},
         clap::CommandFactory,
     };
 
@@ -244,6 +281,10 @@ snapshot_kind = "weekly"
 keep_only = 5
 timeout = 2000
 machine = "Oribos"
+
+[[replicate]]
+target = "ssh://nas/srv/backups"
+keep = 7
 "#;
 
     #[test]
@@ -261,6 +302,77 @@ machine = "Oribos"
         assert_eq!(config.timeout, Some(2000));
         // The value must not carry the TOML quotes.
         assert_eq!(config.machine.as_deref(), Some("Oribos"));
+    }
+
+    #[test]
+    fn parse_replicate_sections() {
+        let config = Config::parse(
+            r#"
+snapshot_prefix = "root"
+
+[[replicate]]
+target = "ssh://backup@nas:2222/srv/backups/behemoth"
+keep = 30
+ssh_options = ["-i", "/root/.ssh/backup_key"]
+
+[[replicate]]
+target = "/mnt/usb/backups"
+"#,
+        )
+        .unwrap();
+        let targets = config.replicate.clone().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0].target,
+            "ssh://backup@nas:2222/srv/backups/behemoth"
+        );
+        assert_eq!(targets[0].keep, Some(30));
+        assert_eq!(targets[0].ssh_options, ["-i", "/root/.ssh/backup_key"]);
+        assert_eq!(targets[1].target, "/mnt/usb/backups");
+        assert_eq!(targets[1].keep, None);
+        assert!(targets[1].ssh_options.is_empty());
+
+        let mut args = Args::default();
+        config.merge_into(&mut args, |_| false);
+        assert_eq!(args.replicate.len(), 2);
+
+        assert!(
+            Config::parse(
+                "[[replicate]]
+keep = 3
+"
+            )
+            .is_err(),
+            "target is mandatory"
+        );
+        assert!(
+            Config::parse(
+                "[[replicate]]
+target = 3
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_validates_replication_targets() {
+        let mut args = Args {
+            snapshot_prefix: "root".into(),
+            database_file: "/db".into(),
+            machine: "m".into(),
+            replicate: vec![ReplicateConfig {
+                target: "nas:/srv".into(),
+                ..ReplicateConfig::default()
+            }],
+            ..Args::default()
+        };
+        assert!(args.normalize().is_err());
+        args.replicate[0].target = "ssh://nas/srv".into();
+        args.replicate[0].keep = Some(0);
+        assert!(args.normalize().is_err());
+        args.replicate[0].keep = Some(1);
+        args.normalize().unwrap();
     }
 
     #[test]
@@ -357,6 +469,9 @@ machine = "Oribos"
         assert_eq!(args.keep_only, 5);
         assert_eq!(args.timeout, 2000);
         assert_eq!(args.machine, "Oribos");
+        assert_eq!(args.replicate.len(), 1);
+        assert_eq!(args.replicate[0].target, "ssh://nas/srv/backups");
+        assert_eq!(args.replicate[0].keep, Some(7));
         // An environment variable counts as explicit, so only check the file value without it.
         if std::env::var_os("RUSNAPSHOT_DB_FILE").is_none() {
             assert_eq!(args.database_file, "/.snapshots/rusnapshot.db");
@@ -396,6 +511,16 @@ machine = "Oribos"
         assert_eq!(args.keep_only, 9);
         assert_eq!(args.timeout, 1);
         assert_eq!(args.machine, "m");
+        assert_eq!(args.replicate.len(), 1, "the file targets stay");
+
+        // --target replaces the file targets.
+        let matches = Args::command()
+            .try_get_matches_from(["rusnapshot", "-c", file, "--send", "--target", "/mnt/usb"])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.replicate.len(), 1);
+        assert_eq!(args.replicate[0].target, "/mnt/usb");
+        assert_eq!(args.replicate[0].keep, None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
