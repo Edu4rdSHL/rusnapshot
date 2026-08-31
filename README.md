@@ -1,5 +1,5 @@
 # Description
-Simple and handy definitions-based snapshoting tool for BTRFS. Supports unattended snapshots, tracking, restoring, automatic cleanup and more. Backed with SQLite.
+Simple and handy definitions-based snapshotting tool for BTRFS. Supports unattended snapshots, tracking, restoring, automatic cleanup and more. Backed with SQLite.
 
 # Documentation
 
