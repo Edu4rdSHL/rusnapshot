@@ -7,7 +7,11 @@ use {
     },
     anyhow::{Context, Result, bail},
     chrono::Utc,
-    prettytable::{Table, row},
+    prettytable::{
+        Attr, Cell, Row, Table, color,
+        format::{Alignment, FormatBuilder, LinePosition, LineSeparator, TableFormat},
+        row,
+    },
     sqlite::Connection,
     std::path::Path,
 };
@@ -332,7 +336,7 @@ pub fn manage_listing(connection: &Connection) -> Result<()> {
     }
     let replicas = database::list_replicas(connection)?;
     if !replicas.is_empty() {
-        println!("\nReplicas:");
+        println!();
         print_replicas(&replicas);
     }
 
@@ -489,9 +493,36 @@ fn remove_filtered_copies(record: &SnapshotRecord) {
     }
 }
 
+/// The default table with the `+` at the line junctions replaced by the line itself. These
+/// tables are wider than a terminal, so the rules wrap at a different point than the rows they
+/// separate and the crosses end up scattered across the screen.
+fn plain_format() -> TableFormat {
+    FormatBuilder::new()
+        .column_separator('|')
+        .borders('|')
+        .separator(LinePosition::Top, LineSeparator::new('-', '-', '-', '-'))
+        .separator(LinePosition::Title, LineSeparator::new('=', '=', '=', '='))
+        .separator(LinePosition::Intern, LineSeparator::new('-', '-', '-', '-'))
+        .separator(LinePosition::Bottom, LineSeparator::new('-', '-', '-', '-'))
+        .padding(1, 1)
+        .build()
+}
+
+/// A heading spanning the whole table, so each listing announces what it is.
+fn banner(title: &str, columns: usize) -> Row {
+    Row::new(vec![
+        Cell::new_align(title, Alignment::CENTER)
+            .with_style(Attr::Bold)
+            .with_style(Attr::ForegroundColor(color::GREEN))
+            .with_hspan(columns),
+    ])
+}
+
 fn print_replicas(replicas: &[ReplicaRecord]) {
     let mut table = Table::new();
-    table.set_titles(row![
+    table.set_format(plain_format());
+    table.set_titles(banner("REPLICAS", 7));
+    table.add_row(row![
         bcFg => "NAME",
         "TARGET",
         "KIND",
@@ -516,7 +547,9 @@ fn print_replicas(replicas: &[ReplicaRecord]) {
 
 fn print_table(records: &[SnapshotRecord]) {
     let mut table = Table::new();
-    table.set_titles(row![
+    table.set_format(plain_format());
+    table.set_titles(banner("SNAPSHOTS", 8));
+    table.add_row(row![
         bcFg => "NAME",
        "ID",
        "KIND",

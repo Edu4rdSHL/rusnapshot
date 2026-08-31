@@ -1617,7 +1617,10 @@ fn list_shows_replicas() {
     let output = sb.run(&["--list", "-d", sb.db_path()]);
     assert!(output.status.success(), "{}", text(&output));
     let out = stdout(&output);
-    assert!(out.contains("Replicas:"), "{out}");
+    assert!(
+        out.contains("SNAPSHOTS") && out.contains("REPLICAS"),
+        "{out}"
+    );
     assert!(out.contains(sb.target_str()), "{out}");
     assert_eq!(out.matches(&record.name).count(), 2, "{out}");
 }
@@ -1733,8 +1736,12 @@ fn send_with_excludes_leaves_the_paths_out_of_the_replica() {
         read_trimmed(&staging.join(".uuid"))
     );
     let output = sb.run(&["--list", "-d", sb.db_path()]);
+    let listing = stdout(&output);
+    assert!(listing.contains("FILTERED"), "{}", text(&output));
     assert!(
-        stdout(&output).contains("FILTERED") && stdout(&output).contains("| yes"),
+        listing
+            .lines()
+            .any(|line| line.contains(&first.name) && line.contains("yes")),
         "{}",
         text(&output)
     );
