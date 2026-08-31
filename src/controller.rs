@@ -94,6 +94,10 @@ pub fn manage_restoring(args: &Args, connection: &Connection) -> Result<()> {
         strip_trailing_slash(&args.dest_dir).to_string()
     };
 
+    if let Some(source) = &args.from_replica {
+        return restore_from_replica(args, connection, &record, &target, source);
+    }
+
     if args.dry_run {
         println!(
             "[dry-run] would run: {}",
@@ -115,6 +119,203 @@ pub fn manage_restoring(args: &Args, connection: &Connection) -> Result<()> {
     println!("The snapshot was successfully restored to {target}");
 
     Ok(())
+}
+
+/// Restore a snapshot from one of its replicas: it is brought back with `btrfs send`/`btrfs
+/// receive` into `<dest_dir>/.restore/`, verified against the target, and the restored copy is
+/// taken from it. The received subvolume is deleted afterwards; the restored copy keeps the data
+/// because they share their extents.
+///
+/// An empty `source` means the target is looked up in the database, which only works when a
+/// single one holds a replica of this snapshot.
+///
+/// # Errors
+///
+/// Fails if the snapshot is already here, the restore target exists, the target can't be
+/// resolved, the replica is missing there, or the transfer or the verification fails.
+fn restore_from_replica(
+    args: &Args,
+    connection: &Connection,
+    record: &SnapshotRecord,
+    target: &str,
+    source: &str,
+) -> Result<()> {
+    let local = record.path();
+    if Path::new(&local).exists() {
+        bail!(
+            "{} is already on this machine at {local}. Restore it with --restore --id {} and no --from-replica",
+            record.name,
+            record.snap_id
+        );
+    }
+    if Path::new(target).exists() {
+        bail!(
+            "the restore target {target} already exists. Move it out of the way first (for example: mv {target} {target}.old) or restore somewhere else with --to"
+        );
+    }
+
+    let source = if source.is_empty() {
+        recorded_target(connection, record)?
+    } else {
+        source.to_string()
+    };
+    let replication = external_replication(args, &source)?;
+    let remote = replication.subvolume_path(&record.name);
+    let filtered = was_filtered(connection, &record.name, &replication.url);
+    if filtered {
+        eprintln!(
+            "Warning: the replica of {} at {} was sent from a filtered copy, so it does not contain the paths excluded for that target. The restore will be missing them.",
+            record.name, replication.url
+        );
+    }
+
+    let staging = format!(
+        "{}/.restore",
+        strip_trailing_slash(&record.destination.clone())
+    );
+    let received = format!("{staging}/{}", record.name);
+
+    if args.dry_run {
+        println!(
+            "[dry-run] would receive {remote} from {} into {staging} and restore it to {target}",
+            replication.url
+        );
+        return Ok(());
+    }
+
+    if !replication.exists(&remote)? {
+        bail!("{remote} does not exist at {}", replication.url);
+    }
+    let source_info = replication.subvolume_info(&remote)?;
+
+    // A copy left behind by an interrupted run would make the receive fail.
+    if Path::new(&received).exists() {
+        eprintln!("Warning: removing the leftover copy {received}");
+        operations::del_snapshot(&received)?;
+    }
+    std::fs::create_dir_all(&staging).with_context(|| format!("failed to create {staging}"))?;
+
+    println!(
+        "Receiving {} from {} into {staging}",
+        record.name, replication.url
+    );
+    let transfer = match replication::receive_from_target(&replication, &record.name, &staging) {
+        Ok(transfer) => transfer,
+        Err(err) => {
+            let _ = operations::del_snapshot(&received);
+            return Err(err);
+        }
+    };
+
+    // A replica is itself a received subvolume, and `btrfs send` propagates the identity it was
+    // received under, not the replica's own uuid. That original identity is what has to come out
+    // the other side; only a replica created at the target by other means carries its own.
+    let expected = source_info
+        .received_uuid
+        .as_deref()
+        .unwrap_or(&source_info.uuid)
+        .to_string();
+    let landed = replication::local_subvolume_info(&received).and_then(|info| {
+        if info.received_uuid.as_deref() == Some(expected.as_str()) {
+            Ok(())
+        } else {
+            bail!(
+                "verification of {} failed: received UUID {} does not match the UUID {expected} of {remote} at {}",
+                record.name,
+                info.received_uuid.as_deref().unwrap_or("-"),
+                replication.url
+            )
+        }
+    });
+    if let Err(err) = landed {
+        let _ = operations::del_snapshot(&received);
+        return Err(err);
+    }
+
+    let seconds = transfer.elapsed.as_secs_f64().max(0.001);
+    println!(
+        "Received {} in {seconds:.1}s, restoring to {target}",
+        replication::human_size(transfer.bytes)
+    );
+    if let Err(err) = operations::restore_snapshot(&received, target) {
+        let _ = operations::del_snapshot(&received);
+        return Err(err);
+    }
+
+    // The restored copy shares its extents with the received subvolume, so dropping it costs
+    // nothing and leaves no untracked snapshot behind.
+    if let Err(err) = operations::del_snapshot(&received) {
+        eprintln!("Warning: {err:#}. The restore is complete, remove {received} by hand.");
+    }
+    let _ = std::fs::remove_dir(&staging);
+
+    println!("The snapshot was successfully restored to {target}");
+    if filtered {
+        println!(
+            "Remember that the paths excluded for {} are not in it.",
+            replication.url
+        );
+    }
+
+    Ok(())
+}
+
+/// Target holding the replica of `record`, from the database. The whole point of `--from-replica`
+/// without a value: the replicas are already recorded, so the target does not have to be typed
+/// again.
+///
+/// # Errors
+///
+/// Fails when no replica of the snapshot is recorded, or when several targets hold one and there
+/// is no way to tell which is meant.
+fn recorded_target(connection: &Connection, record: &SnapshotRecord) -> Result<String> {
+    let mut targets: Vec<String> = database::list_replicas(connection)?
+        .into_iter()
+        .filter(|replica| replica.snap_id == record.snap_id)
+        .map(|replica| replica.target)
+        .collect();
+    targets.sort();
+    targets.dedup();
+
+    match targets.len() {
+        0 => bail!(
+            "no replica of {} is recorded. Give the target with --from-replica <TARGET>",
+            record.name
+        ),
+        1 => Ok(targets.remove(0)),
+        _ => bail!(
+            "{} is replicated to several targets, pick one with --from-replica <TARGET>: {}",
+            record.name,
+            targets.join(", ")
+        ),
+    }
+}
+
+/// Replication for a `--from-replica` target: reuses the `ssh_options` of the matching
+/// `[[replicate]]` section so a restore needs no extra configuration.
+fn external_replication(args: &Args, source: &str) -> Result<replication::Replication> {
+    let config = args
+        .replicate
+        .iter()
+        .find(|config| config.target == source)
+        .cloned()
+        .unwrap_or_else(|| crate::args::ReplicateConfig {
+            target: source.to_string(),
+            ..crate::args::ReplicateConfig::default()
+        });
+
+    replication::Replication::from_config(&config)
+}
+
+/// Whether the replica of `name` at `target` was sent from a filtered copy.
+fn was_filtered(connection: &Connection, name: &str, target: &str) -> bool {
+    database::list_replicas(connection).is_ok_and(|replicas| {
+        replicas.iter().any(|replica| {
+            replica.name == name
+                && replica.target == target
+                && replica.local_path.contains("/.staging/")
+        })
+    })
 }
 
 /// Print every tracked snapshot.

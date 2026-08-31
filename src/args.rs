@@ -82,6 +82,18 @@ pub struct Args {
     /// With --target, path inside the snapshot to leave out of the replicas, relative to the snapshot root. Repeatable.
     #[arg(long = "exclude", requires = "target", value_name = "PATH")]
     pub exclude: Vec<String>,
+
+    /// Restore from a replica instead of from the local snapshot. The target is taken from the
+    /// database; give one (an absolute path or ssh://user@host:port/path) to pick between several.
+    #[arg(
+        long = "from-replica",
+        value_name = "TARGET",
+        num_args = 0..=1,
+        default_missing_value = "",
+        requires = "restore_snapshot",
+        conflicts_with_all = ["create_snapshot", "delete_snapshot", "clean_snapshots", "send_snapshots"]
+    )]
+    pub from_replica: Option<String>,
     /// Show what would be created, deleted, restored or sent without doing it.
     #[arg(long = "dry-run")]
     pub dry_run: bool,

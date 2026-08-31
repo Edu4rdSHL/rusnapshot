@@ -412,47 +412,18 @@ pub fn send_and_receive(
         }
     };
 
-    let mut output = send.stdout.take().context("no stdout from 'btrfs send'")?;
-    let mut input = receive
+    let output = send.stdout.take().context("no stdout from 'btrfs send'")?;
+    let input = receive
         .stdin
         .take()
         .context("no stdin for 'btrfs receive'")?;
-    let mut buffer = vec![0u8; 1 << 20];
-    let mut bytes = 0u64;
-    let started = Instant::now();
-    let mut last_report = started;
-    let interactive = std::io::stderr().is_terminal();
-    let mut read_error = None;
-    let mut write_error = None;
+    let Pumped {
+        bytes,
+        started,
+        read_error,
+        write_error,
+    } = pump(output, input, "sent");
 
-    loop {
-        let read = match output.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(err) => {
-                read_error = Some(anyhow!(err).context("failed to read from 'btrfs send'"));
-                break;
-            }
-        };
-        if let Err(err) = input.write_all(&buffer[..read]) {
-            write_error = Some(anyhow!(err).context("failed to write to 'btrfs receive'"));
-            break;
-        }
-        bytes += read as u64;
-        if interactive && last_report.elapsed() >= Duration::from_secs(1) {
-            let rate = bytes as f64 / started.elapsed().as_secs_f64();
-            eprint!(
-                "\r  {} sent, {}/s      ",
-                human_size(bytes),
-                human_size(rate as u64)
-            );
-            last_report = Instant::now();
-        }
-    }
-    drop(input);
-    if interactive && bytes > 0 {
-        eprint!("\r{}\r", " ".repeat(60));
-    }
     if read_error.is_some() || write_error.is_some() {
         let _ = send.kill();
     }
@@ -482,6 +453,135 @@ pub fn send_and_receive(
     }
     if let Err(err) = replication.sync_filesystem() {
         eprintln!("Warning: {err:#}. The replica is complete but may still be in the page cache.");
+    }
+
+    Ok(Transfer {
+        bytes,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// What a transfer moved, plus whichever side of the pipe broke.
+struct Pumped {
+    bytes: u64,
+    started: Instant,
+    read_error: Option<anyhow::Error>,
+    write_error: Option<anyhow::Error>,
+}
+
+/// Copy a send stream from one side of the pipe to the other, reporting progress on a terminal.
+/// Errors are returned rather than raised so the caller can wait on both children first and blame
+/// the side that actually failed.
+fn pump(mut output: impl Read, mut input: impl Write, verb: &str) -> Pumped {
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut bytes = 0u64;
+    let started = Instant::now();
+    let mut last_report = started;
+    let interactive = std::io::stderr().is_terminal();
+    let mut read_error = None;
+    let mut write_error = None;
+
+    loop {
+        let read = match output.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) => {
+                read_error = Some(anyhow!(err).context("failed to read from 'btrfs send'"));
+                break;
+            }
+        };
+        if let Err(err) = input.write_all(&buffer[..read]) {
+            write_error = Some(anyhow!(err).context("failed to write to 'btrfs receive'"));
+            break;
+        }
+        bytes += read as u64;
+        if interactive && last_report.elapsed() >= Duration::from_secs(1) {
+            let rate = bytes as f64 / started.elapsed().as_secs_f64();
+            eprint!(
+                "\r  {} {verb}, {}/s      ",
+                human_size(bytes),
+                human_size(rate as u64)
+            );
+            last_report = Instant::now();
+        }
+    }
+    drop(input);
+    if interactive && bytes > 0 {
+        eprint!("\r{}\r", " ".repeat(60));
+    }
+
+    Pumped {
+        bytes,
+        started,
+        read_error,
+        write_error,
+    }
+}
+
+/// Bring a replica back from a target: `btrfs send` runs at the target side and its stream is
+/// received into `into` here. The mirror image of [`send_and_receive`].
+///
+/// # Errors
+///
+/// Fails if either side can't be started, the transfer breaks, or either command fails.
+pub fn receive_from_target(replication: &Replication, name: &str, into: &str) -> Result<Transfer> {
+    let remote = replication.subvolume_path(name);
+    let mut send = replication
+        .command(&strings(&["btrfs", "send", &remote]), true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start 'btrfs send' at {}", replication.url))?;
+    let mut receive = match Command::new("btrfs")
+        .args(["receive", into])
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = send.kill();
+            let _ = send.wait();
+            return Err(err).context(
+                "failed to execute 'btrfs receive', make sure btrfs-progs is installed and in PATH",
+            );
+        }
+    };
+
+    let output = send.stdout.take().context("no stdout from 'btrfs send'")?;
+    let input = receive
+        .stdin
+        .take()
+        .context("no stdin for 'btrfs receive'")?;
+    let Pumped {
+        bytes,
+        started,
+        read_error,
+        write_error,
+    } = pump(output, input, "received");
+
+    if read_error.is_some() || write_error.is_some() {
+        let _ = send.kill();
+    }
+    let send_status = send.wait().context("failed to wait for 'btrfs send'")?;
+    let receive_status = receive
+        .wait()
+        .context("failed to wait for 'btrfs receive'")?;
+
+    // When the receiving side died the send failure is only a consequence, report the cause.
+    if write_error.is_some() && !receive_status.success() {
+        bail!("'btrfs receive {into}' failed with {receive_status}");
+    }
+    if !send_status.success() {
+        bail!(
+            "'btrfs send {remote}' at {} failed with {send_status}",
+            replication.url
+        );
+    }
+    if !receive_status.success() {
+        bail!("'btrfs receive {into}' failed with {receive_status}");
+    }
+    if let Some(err) = write_error.or(read_error) {
+        return Err(err);
     }
 
     Ok(Transfer {

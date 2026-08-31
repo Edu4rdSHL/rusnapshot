@@ -65,13 +65,17 @@ case "$sub/$op" in
     if [ "$1" = "-p" ]; then parent=$(cat "$2/.uuid"); shift 2; fi
     path="$1"
     [ -f "$path/.uuid" ] || { echo "ERROR: not a subvolume: $path" >&2; exit 1; }
-    printf 'FAKE-BTRFS-STREAM name=%s uuid=%s parent=%s\n' "$(basename "$path")" "$(cat "$path/.uuid")" "$parent"
+    # A received subvolume travels under the identity it was received with, not its own uuid.
+    uuid=$(cat "$path/.uuid")
+    [ -f "$path/.received_uuid" ] && uuid=$(cat "$path/.received_uuid")
+    printf 'FAKE-BTRFS-STREAM name=%s uuid=%s src=%s parent=%s\n' "$(basename "$path")" "$uuid" "$path" "$parent"
     head -c "${FAKE_BTRFS_PAYLOAD:-$(datasize "$path")}" /dev/zero ;;
   receive/*)
     dir="$op"
     header=$(head -n1); cat > /dev/null
     name=${header#*name=}; name=${name%% *}
     uuid=${header#*uuid=}; uuid=${uuid%% *}
+    src=${header#*src=}; src=${src%% *}
     parent=${header#*parent=}
     [ -d "$dir" ] || { echo "ERROR: cannot access '$dir'" >&2; exit 1; }
     [ -e "$dir/$name" ] && { echo "ERROR: creating snapshot $name: File exists" >&2; exit 1; }
@@ -80,7 +84,11 @@ case "$sub/$op" in
       for d in "$dir"/*/; do [ -f "$d/.received_uuid" ] && [ "$(cat "$d/.received_uuid")" = "$parent" ] && found=1; done
       [ $found = 1 ] || { echo "ERROR: cannot find parent subvolume" >&2; exit 1; }
     fi
-    mkdir "$dir/$name" && newuuid > "$dir/$name/.uuid"
+    mkdir "$dir/$name" || exit 1
+    # The stream carries what it was made from, so a replica ends up with the same content.
+    case "$src" in "${FAKE_BTRFS_SANDBOX:-/nonexistent}"/*) [ -d "$src" ] && cp -a "$src/." "$dir/$name/" ;; esac
+    rm -f "$dir/$name/.ro"
+    newuuid > "$dir/$name/.uuid"
     if [ -n "$FAKE_BTRFS_RECEIVE_FAIL" ]; then echo "ERROR: fake receive failure" >&2; exit 1; fi
     echo "$uuid" > "$dir/$name/.received_uuid" ;;
   *) echo "fake btrfs: unsupported command: $sub $op $*" >&2; exit 1 ;;
@@ -1999,4 +2007,142 @@ fn an_incomplete_filtered_copy_is_rebuilt() {
     assert!(!staging.join("cache").exists());
     assert_eq!(staging_dirs(&sb).len(), 1);
     assert_eq!(sb.replicas().len(), 1);
+}
+
+#[test]
+fn restore_from_a_replica_brings_the_snapshot_back() {
+    let sb = Sandbox::new("restore-external");
+    write_blob(&sb.src.join("keep/a.bin"), 2);
+    write_blob(&sb.src.join("cache/b.bin"), 3);
+    let config = exclude_config(&sb, sb.target_str(), "\"cache\"");
+
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let record = sb.records().remove(0);
+    assert!(sb.run(&["-c", &config, "--send"]).status.success());
+
+    let restored = sb.dir.join("restored");
+    let restored_str = restored.to_str().unwrap().to_string();
+    // No target is given: the one holding the replica comes from the database.
+    let pull: Vec<&str> = vec![
+        "-c",
+        &config,
+        "--restore",
+        "--id",
+        &record.snap_id,
+        "--from-replica",
+        "--to",
+        &restored_str,
+    ];
+
+    // While the snapshot is still here there is nothing to pull, and it says so.
+    let output = sb.run(&pull);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("already on this machine"),
+        "{}",
+        text(&output)
+    );
+    assert!(!restored.exists());
+
+    // The snapshot disappears from this machine; the replica is all that is left.
+    let staging = staging_dirs(&sb)[0].join(&record.name);
+    fs::remove_dir_all(&staging).unwrap();
+    fs::remove_dir_all(record.path()).unwrap();
+
+    let mut dry = pull.clone();
+    dry.push("--dry-run");
+    let output = sb.run(&dry);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("would receive"),
+        "{}",
+        text(&output)
+    );
+    assert!(!restored.exists(), "a dry run must not restore anything");
+    assert!(!sb.snaps.join(".restore").exists());
+
+    let output = sb.run(&pull);
+    assert!(output.status.success(), "{}", text(&output));
+    let out = text(&output);
+    // The replica went out filtered, so the restore is warned to be incomplete.
+    assert!(out.contains("was sent from a filtered copy"), "{out}");
+    assert!(restored.join("keep/a.bin").exists(), "{out}");
+    assert!(
+        !restored.join("cache").exists(),
+        "the excluded path is gone"
+    );
+    assert!(!restored.join(".ro").exists(), "the restore is writable");
+    // The received copy is dropped again, so no untracked subvolume is left behind.
+    assert!(
+        !sb.snaps.join(".restore").exists(),
+        "{:?}",
+        sb.snaps.join(".restore")
+    );
+    assert!(
+        sb.log().contains(&format!(
+            "btrfs send {}\n",
+            sb.target.join(&record.name).display()
+        )),
+        "{}",
+        sb.log()
+    );
+
+    // Restoring on top of the result is refused instead of clobbering it.
+    let output = sb.run(&pull);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("already exists"),
+        "{}",
+        text(&output)
+    );
+
+    // A source that does not hold the replica fails before touching anything.
+    let empty = sb.dir.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let other = sb.dir.join("restored2");
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--restore",
+        "--id",
+        &record.snap_id,
+        "--from-replica",
+        empty.to_str().unwrap(),
+        "--to",
+        other.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("does not exist at"),
+        "{}",
+        text(&output)
+    );
+    assert!(!other.exists());
+
+    // A snapshot that was never replicated has no target to resolve.
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let fresh = sb
+        .records()
+        .into_iter()
+        .find(|r| r.name != record.name)
+        .unwrap();
+    fs::remove_dir_all(fresh.path()).unwrap();
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--restore",
+        "--id",
+        &fresh.snap_id,
+        "--from-replica",
+        "--to",
+        other.to_str().unwrap(),
+    ]);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("no replica of")
+            && text(&output).contains("--from-replica <TARGET>"),
+        "{}",
+        text(&output)
+    );
+    assert!(!other.exists());
 }
