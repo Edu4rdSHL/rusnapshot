@@ -79,6 +79,9 @@ pub struct Args {
     /// Replication target for --send, instead of the configuration file ones: an absolute path or ssh://user@host:port/path (user and port are optional).
     #[arg(long = "target", requires = "send_snapshots", conflicts_with_all = ["create_snapshot", "delete_snapshot", "restore_snapshot", "clean_snapshots"])]
     pub target: Option<String>,
+    /// With --target, path inside the snapshot to leave out of the replicas, relative to the snapshot root. Repeatable.
+    #[arg(long = "exclude", requires = "target", value_name = "PATH")]
+    pub exclude: Vec<String>,
     /// Show what would be created, deleted, restored or sent without doing it.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
@@ -122,6 +125,7 @@ impl Args {
                 target: target.clone(),
                 keep: None,
                 ssh_options: Vec::new(),
+                exclude: args.exclude.clone(),
             }];
         }
 
@@ -197,6 +201,9 @@ pub struct ReplicateConfig {
     /// Extra `ssh` options, for example `["-i", "/root/.ssh/backup_key"]`.
     #[serde(default)]
     pub ssh_options: Vec<String>,
+    /// Paths inside the snapshot to leave out of the replicas, relative to the snapshot root.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl Config {
@@ -314,6 +321,7 @@ snapshot_prefix = "root"
 target = "ssh://backup@nas:2222/srv/backups/behemoth"
 keep = 30
 ssh_options = ["-i", "/root/.ssh/backup_key"]
+exclude = ["edu4rdshl/.cache", "edu4rdshl/Games"]
 
 [[replicate]]
 target = "/mnt/usb/backups"
@@ -328,6 +336,8 @@ target = "/mnt/usb/backups"
         );
         assert_eq!(targets[0].keep, Some(30));
         assert_eq!(targets[0].ssh_options, ["-i", "/root/.ssh/backup_key"]);
+        assert_eq!(targets[0].exclude, ["edu4rdshl/.cache", "edu4rdshl/Games"]);
+        assert!(targets[1].exclude.is_empty());
         assert_eq!(targets[1].target, "/mnt/usb/backups");
         assert_eq!(targets[1].keep, None);
         assert!(targets[1].ssh_options.is_empty());

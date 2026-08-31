@@ -17,24 +17,31 @@ use {
 
 const FAKE_BTRFS: &str = r#"#!/usr/bin/env bash
 # Fake btrfs: logs every invocation and simulates subvolumes with plain directories.
-# A subvolume is a directory holding a .uuid file; a received one also holds .received_uuid.
+# A subvolume is a directory holding a .uuid file; a received one also holds .received_uuid,
+# a read-only one holds .ro. Snapshots copy the content of sandbox paths.
 LOG="${FAKE_BTRFS_LOG:?}"
 echo "btrfs $*" >> "$LOG"
 if [ -n "$FAKE_BTRFS_FAIL" ]; then echo "fake btrfs: forced failure" >&2; exit 1; fi
 newuuid() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | sed 's/\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)/\1-\2-\3-\4-\5/'; }
+datasize() { find "$1" -type f ! -name .uuid ! -name .received_uuid ! -name .ro -printf '%s\n' | awk '{s+=$1} END {print s+0}'; }
 sub="$1"; op="$2"; shift 2
 case "$sub/$op" in
   subvolume/create)
     [ -d "$(dirname "$1")" ] || { echo "ERROR: cannot access '$1'" >&2; exit 1; }
     mkdir "$1" && newuuid > "$1/.uuid" ;;
   subvolume/snapshot)
-    pos=()
-    for a in "$@"; do [ "$a" = "-r" ] || pos+=("$a"); done
+    ro=0; pos=()
+    for a in "$@"; do if [ "$a" = "-r" ]; then ro=1; else pos+=("$a"); fi; done
     src="${pos[0]}"; dst="${pos[1]}"
     [ -d "$src" ] || { echo "ERROR: cannot access '$src'" >&2; exit 1; }
     if [ -d "$dst" ]; then dst="$dst/$(basename "$src")"; fi
     [ -d "$(dirname "$dst")" ] || { echo "ERROR: cannot access '$dst': No such file or directory" >&2; exit 1; }
-    mkdir "$dst" && newuuid > "$dst/.uuid" ;;
+    mkdir "$dst" || exit 1
+    case "$src" in "${FAKE_BTRFS_SANDBOX:-/nonexistent}"/*) cp -a "$src/." "$dst/" ;; esac
+    rm -f "$dst/.received_uuid" "$dst/.ro"
+    newuuid > "$dst/.uuid"
+    if [ "$ro" = 1 ]; then touch "$dst/.ro"; fi
+    exit 0 ;;
   subvolume/delete)
     [ -d "$1" ] || { echo "ERROR: Not a Btrfs subvolume: $1" >&2; exit 1; }
     rm -rf "$1" ;;
@@ -44,6 +51,14 @@ case "$sub/$op" in
     [ -f "$1/.uuid" ] || { echo "ERROR: Not a Btrfs subvolume: $1" >&2; exit 1; }
     recv="-"; [ -f "$1/.received_uuid" ] && recv=$(cat "$1/.received_uuid")
     printf '%s\n\tName: \t\t\t%s\n\tUUID: \t\t\t%s\n\tParent UUID: \t\t-\n\tReceived UUID: \t\t%s\n\tFlags: \t\t\treadonly\n' "$1" "$(basename "$1")" "$(cat "$1/.uuid")" "$recv" ;;
+  property/set)
+    [ "$1" = "-ts" ] && shift
+    [ -f "$1/.uuid" ] || { echo "ERROR: not a subvolume: $1" >&2; exit 1; }
+    if [ "$2" = "ro" ]; then if [ "$3" = "true" ]; then touch "$1/.ro"; else rm -f "$1/.ro"; fi; fi ;;
+  property/get)
+    [ "$1" = "-ts" ] && shift
+    [ -f "$1/.uuid" ] || { echo "ERROR: not a subvolume: $1" >&2; exit 1; }
+    if [ -f "$1/.ro" ]; then echo "ro=true"; else echo "ro=false"; fi ;;
   send/*)
     set -- "$op" "$@"
     parent="-"
@@ -51,7 +66,7 @@ case "$sub/$op" in
     path="$1"
     [ -f "$path/.uuid" ] || { echo "ERROR: not a subvolume: $path" >&2; exit 1; }
     printf 'FAKE-BTRFS-STREAM name=%s uuid=%s parent=%s\n' "$(basename "$path")" "$(cat "$path/.uuid")" "$parent"
-    head -c "${FAKE_BTRFS_PAYLOAD:-1048576}" /dev/zero ;;
+    head -c "${FAKE_BTRFS_PAYLOAD:-$(datasize "$path")}" /dev/zero ;;
   receive/*)
     dir="$op"
     header=$(head -n1); cat > /dev/null
@@ -143,6 +158,7 @@ impl Sandbox {
             .current_dir(&self.dir)
             .env("PATH", path)
             .env("FAKE_BTRFS_LOG", &self.log)
+            .env("FAKE_BTRFS_SANDBOX", &self.dir)
             .env_remove("RUSNAPSHOT_DB_FILE")
             .env_remove("POSIXLY_CORRECT");
         for (key, value) in env {
@@ -1635,4 +1651,352 @@ fn send_syncs_the_target_filesystem_after_receiving() {
         "{}",
         sb.log()
     );
+}
+
+fn write_blob(path: &Path, mib: usize) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, vec![7u8; mib << 20]).unwrap();
+}
+
+/// Directories under `snaps/.staging` (one per distinct exclude list).
+fn staging_dirs(sb: &Sandbox) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(sb.snaps.join(".staging")) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+    dirs.sort();
+    dirs
+}
+
+fn exclude_config(sb: &Sandbox, target: &str, excludes: &str) -> String {
+    sb.write(
+        "config.toml",
+        &format!(
+            "dest_dir = \"{}\"\nsource_dir = \"{}\"\ndatabase_file = \"{}\"\nsnapshot_prefix = \"p\"\nmachine = \"test\"\n\n[[replicate]]\ntarget = \"{}\"\nexclude = [{}]\n",
+            sb.snaps.display(),
+            sb.src.display(),
+            sb.db.display(),
+            target,
+            excludes
+        ),
+    )
+}
+
+#[test]
+fn send_with_excludes_leaves_the_paths_out_of_the_replica() {
+    let sb = Sandbox::new("send-exclude");
+    write_blob(&sb.src.join("keep/a.bin"), 2);
+    write_blob(&sb.src.join("cache/b.bin"), 3);
+    let config = exclude_config(&sb, sb.target_str(), "\"cache\", \"missing/dir\"");
+
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let first = sb.records().remove(0);
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let out = stdout(&output);
+    assert!(out.contains("excluding 1 path(s), 3.0 MiB"), "{out}");
+    assert!(
+        out.contains("Sent ") && out.contains(": 2.0 MiB in"),
+        "{out}"
+    );
+
+    let dirs = staging_dirs(&sb);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let staging = dirs[0].join(&first.name);
+    assert!(
+        staging.join(".ro").exists(),
+        "the filtered copy must be read-only"
+    );
+    assert!(!staging.join("cache").exists());
+    assert!(staging.join("keep/a.bin").exists());
+    // The snapshot itself is untouched.
+    assert!(Path::new(&first.path()).join("cache/b.bin").exists());
+    // The replica was sent from the filtered copy and is recorded as such.
+    assert!(
+        sb.log()
+            .contains(&format!("btrfs send {}\n", staging.display())),
+        "{}",
+        sb.log()
+    );
+    let replicas = sb.replicas();
+    assert_eq!(replicas[0].local_path, staging.to_str().unwrap());
+    assert_eq!(
+        read_trimmed(&sb.target.join(&first.name).join(".received_uuid")),
+        read_trimmed(&staging.join(".uuid"))
+    );
+    let output = sb.run(&["--list", "-d", sb.db_path()]);
+    assert!(
+        stdout(&output).contains("FILTERED") && stdout(&output).contains("| yes"),
+        "{}",
+        text(&output)
+    );
+
+    // Incremental sends chain between filtered copies.
+    write_blob(&sb.src.join("keep/c.bin"), 1);
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let second = sb
+        .records()
+        .into_iter()
+        .find(|r| r.name != first.name)
+        .unwrap();
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains(&format!("incremental from {}", first.name)),
+        "{}",
+        text(&output)
+    );
+    let staging2 = dirs[0].join(&second.name);
+    assert!(
+        sb.log().contains(&format!(
+            "btrfs send -p {} {}\n",
+            staging.display(),
+            staging2.display()
+        )),
+        "{}",
+        sb.log()
+    );
+    assert!(!staging2.join("cache").exists());
+
+    // Deleting a snapshot deletes its filtered copy.
+    let output = sb.run(&[
+        "--del",
+        "--id",
+        &first.snap_id,
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("Deleted the filtered copy"),
+        "{}",
+        text(&output)
+    );
+    assert!(!staging.exists());
+    assert!(staging2.exists());
+
+    // Deleting the last snapshot of a list removes its now empty directory too.
+    let output = sb.run(&[
+        "--del",
+        "--id",
+        &second.snap_id,
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(staging_dirs(&sb).is_empty(), "{:?}", staging_dirs(&sb));
+}
+
+#[test]
+fn send_dry_run_reports_excludes_without_a_filtered_copy() {
+    let sb = Sandbox::new("send-exclude-dry-run");
+    write_blob(&sb.src.join("keep/a.bin"), 2);
+    write_blob(&sb.src.join("cache/b.bin"), 3);
+    sb.create(&["--prefix", "p"]);
+    let output = sb.run(&[
+        "--send",
+        "--prefix",
+        "p",
+        "--target",
+        sb.target_str(),
+        "--exclude",
+        "cache",
+        "--exclude",
+        "./keep/",
+        "--dry-run",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("excluding 2 path(s), 5.0 MiB: cache, keep"),
+        "{}",
+        text(&output)
+    );
+    assert!(staging_dirs(&sb).is_empty());
+    assert!(!sb.log().contains("property set"));
+    assert!(sb.replicas().is_empty());
+}
+
+#[test]
+fn exclude_entries_are_validated() {
+    let sb = Sandbox::new("exclude-validation");
+    sb.create(&["--prefix", "p"]);
+    for bad in ["/abs/path", "../x", "a/../b", ".", ""] {
+        let output = sb.run(&[
+            "--send",
+            "--target",
+            sb.target_str(),
+            "--exclude",
+            bad,
+            "-m",
+            "test",
+            "-d",
+            sb.db_path(),
+        ]);
+        assert_failed(&output, "exclude");
+    }
+    let config = exclude_config(&sb, sb.target_str(), "\"/etc\"");
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert_failed(&output, "exclude");
+    assert!(sb.replicas().is_empty());
+    assert!(!sb.log().contains("btrfs send"));
+}
+
+#[test]
+fn send_with_excludes_over_ssh_via_flags() {
+    let sb = Sandbox::new("send-exclude-ssh");
+    write_blob(&sb.src.join("keep/a.bin"), 1);
+    write_blob(&sb.src.join("cache/b.bin"), 1);
+    sb.create(&["--prefix", "p"]);
+    let record = sb.records().remove(0);
+    let url = format!("ssh://backup@nas{}", sb.target_str());
+    let output = sb.run(&[
+        "--send",
+        "--prefix",
+        "p",
+        "--target",
+        &url,
+        "--exclude",
+        "cache",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    let staging = staging_dirs(&sb)[0].join(&record.name);
+    assert_eq!(
+        read_trimmed(&sb.target.join(&record.name).join(".received_uuid")),
+        read_trimmed(&staging.join(".uuid"))
+    );
+    assert!(
+        sb.log().contains(&format!(
+            "ssh backup@nas: sudo -n btrfs receive {}\n",
+            sb.target_str()
+        )),
+        "{}",
+        sb.log()
+    );
+    assert_eq!(sb.replicas()[0].local_path, staging.to_str().unwrap());
+}
+
+#[test]
+fn different_exclude_lists_get_their_own_filtered_copies() {
+    let sb = Sandbox::new("send-exclude-multi");
+    write_blob(&sb.src.join("keep/a.bin"), 1);
+    write_blob(&sb.src.join("cache/b.bin"), 1);
+    let t1 = sb.dir.join("t1");
+    let t2 = sb.dir.join("t2");
+    let t3 = sb.dir.join("t3");
+    for t in [&t1, &t2, &t3] {
+        fs::create_dir_all(t).unwrap();
+    }
+    let config = sb.write(
+        "config.toml",
+        &format!(
+            "dest_dir = \"{}\"\nsource_dir = \"{}\"\ndatabase_file = \"{}\"\nsnapshot_prefix = \"p\"\nmachine = \"test\"\n\n[[replicate]]\ntarget = \"{}\"\nexclude = [\"cache\"]\n\n[[replicate]]\ntarget = \"{}\"\nexclude = [\"keep\"]\n\n[[replicate]]\ntarget = \"{}\"\nexclude = [\"cache/\"]\n",
+            sb.snaps.display(), sb.src.display(), sb.db.display(), t1.display(), t2.display(), t3.display()
+        ),
+    );
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let record = sb.records().remove(0);
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        stdout(&output).matches("Sent ").count(),
+        3,
+        "{}",
+        text(&output)
+    );
+    assert!(
+        stdout(&output).contains("filtered copy reused"),
+        "{}",
+        text(&output)
+    );
+
+    let dirs = staging_dirs(&sb);
+    assert_eq!(dirs.len(), 2, "same list shares a copy: {dirs:?}");
+    let replicas = sb.replicas();
+    assert_eq!(replicas.len(), 3);
+    let by_target = |t: &Path| {
+        replicas
+            .iter()
+            .find(|r| r.target == t.to_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(by_target(&t1).local_path, by_target(&t3).local_path);
+    assert_ne!(by_target(&t1).local_path, by_target(&t2).local_path);
+    assert!(!Path::new(&by_target(&t1).local_path).join("cache").exists());
+    assert!(Path::new(&by_target(&t1).local_path).join("keep").exists());
+    assert!(!Path::new(&by_target(&t2).local_path).join("keep").exists());
+    assert!(Path::new(&by_target(&t2).local_path).join("cache").exists());
+    for t in [&t1, &t2, &t3] {
+        assert!(t.join(&record.name).exists());
+    }
+}
+
+#[test]
+fn an_incomplete_filtered_copy_is_rebuilt() {
+    let sb = Sandbox::new("send-exclude-rebuild");
+    write_blob(&sb.src.join("keep/a.bin"), 1);
+    write_blob(&sb.src.join("cache/b.bin"), 1);
+    sb.create(&["--prefix", "p"]);
+    let record = sb.records().remove(0);
+    assert!(
+        sb.run(&[
+            "--send",
+            "--prefix",
+            "p",
+            "--target",
+            sb.target_str(),
+            "--exclude",
+            "cache",
+            "-m",
+            "test",
+            "-d",
+            sb.db_path()
+        ])
+        .status
+        .success()
+    );
+    let staging = staging_dirs(&sb)[0].join(&record.name);
+
+    // Simulate a copy left half-built (never set read-only) and a lost replica record.
+    fs::remove_file(staging.join(".ro")).unwrap();
+    write_blob(&staging.join("cache/leftover.bin"), 1);
+    fs::remove_dir_all(sb.target.join(&record.name)).unwrap();
+    {
+        let connection = sqlite::open(&sb.db).unwrap();
+        connection.execute("DELETE FROM replicas").unwrap();
+    }
+    let output = sb.run(&[
+        "--send",
+        "--prefix",
+        "p",
+        "--target",
+        sb.target_str(),
+        "--exclude",
+        "cache",
+        "-m",
+        "test",
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stderr(&output).contains("incomplete filtered copy"),
+        "{}",
+        text(&output)
+    );
+    assert!(staging.join(".ro").exists());
+    assert!(!staging.join("cache").exists());
+    assert_eq!(staging_dirs(&sb).len(), 1);
+    assert_eq!(sb.replicas().len(), 1);
 }

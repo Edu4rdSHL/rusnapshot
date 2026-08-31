@@ -8,15 +8,16 @@
 use {
     crate::{
         args::{Args, ReplicateConfig},
-        database,
+        database, operations,
         structs::{ReplicaRecord, SnapshotRecord},
         utils::strip_trailing_slash,
     },
     anyhow::{Context, Result, anyhow, bail},
     sqlite::Connection,
     std::{
+        fs,
         io::{IsTerminal, Read, Write},
-        path::Path,
+        path::{Component, Path, PathBuf},
         process::{Command, Stdio},
         time::{Duration, Instant},
     },
@@ -107,6 +108,9 @@ pub struct Replication {
     pub keep: Option<usize>,
     /// Extra options for `ssh`, such as `-i /root/.ssh/backup_key`.
     pub ssh_options: Vec<String>,
+    /// Paths left out of the replicas, relative to the root of the source subvolume, normalized
+    /// and sorted. Empty means the snapshots are sent as they are.
+    pub exclude: Vec<String>,
 }
 
 /// Result of one send.
@@ -136,6 +140,7 @@ impl Replication {
             target,
             keep: config.keep,
             ssh_options: config.ssh_options.clone(),
+            exclude: normalize_excludes(&config.exclude)?,
         })
     }
 
@@ -554,8 +559,24 @@ fn replicate_to(
             )?
             .into_iter()
             .next();
+            let filter = if replication.exclude.is_empty() {
+                String::new()
+            } else {
+                match measure_excludes(&path, &replication.exclude) {
+                    Ok(excluded) => format!(
+                        ", excluding {} path(s), {}: {}",
+                        excluded.paths,
+                        human_size(excluded.bytes),
+                        replication.exclude.join(", ")
+                    ),
+                    Err(err) => format!(
+                        ", excluding {} (could not measure: {err:#})",
+                        replication.exclude.join(", ")
+                    ),
+                }
+            };
             println!(
-                "[dry-run] would send {} to {} ({})",
+                "[dry-run] would send {} to {} ({}{filter})",
                 snapshot.name,
                 replication.url,
                 describe_parent(parent.as_ref())
@@ -585,7 +606,13 @@ fn replicate_one(
     snapshot: &SnapshotRecord,
     path: &str,
 ) -> Result<()> {
-    let source = local_subvolume_info(path)?;
+    // With excludes, what travels is a filtered copy of the snapshot, not the snapshot itself.
+    let (send_path, excluded) = if replication.exclude.is_empty() {
+        (path.to_string(), None)
+    } else {
+        prepare_staging(snapshot, replication)?
+    };
+    let source = local_subvolume_info(&send_path)?;
     let remote_path = replication.subvolume_path(&snapshot.name);
 
     if replication.exists(&remote_path)? {
@@ -595,7 +622,7 @@ fn replicate_one(
                 "{} is already present at {}, recording it",
                 snapshot.name, replication.url
             );
-            database::insert_replica(connection, &record(snapshot, path, replication, None))?;
+            database::insert_replica(connection, &record(snapshot, &send_path, replication, None))?;
             return Ok(());
         }
         eprintln!(
@@ -607,10 +634,14 @@ fn replicate_one(
 
     let parent = choose_parent(connection, replication, snapshot)?;
     let mode = describe_parent(parent.as_ref());
-    println!("Sending {} to {} ({mode})", snapshot.name, replication.url);
+    let filter = describe_excluded(replication, excluded);
+    println!(
+        "Sending {} to {} ({mode}{filter})",
+        snapshot.name, replication.url
+    );
 
     let transfer = match send_and_receive(
-        path,
+        &send_path,
         parent.as_ref().map(|parent| parent.local_path.as_str()),
         replication,
     ) {
@@ -641,14 +672,14 @@ fn replicate_one(
         connection,
         &record(
             snapshot,
-            path,
+            &send_path,
             replication,
             parent.map(|parent| parent.name),
         ),
     )?;
     let seconds = transfer.elapsed.as_secs_f64().max(0.001);
     println!(
-        "Sent {} to {}: {} in {seconds:.1}s ({}/s), {mode}",
+        "Sent {} to {}: {} in {seconds:.1}s ({}/s), {mode}{filter}",
         snapshot.name,
         replication.url,
         human_size(transfer.bytes),
@@ -757,6 +788,238 @@ fn prune_target(
     }
 
     Ok(())
+}
+
+/// Normalize the `exclude` entries of a target: relative paths inside the snapshot, without
+/// leading `./`, trailing `/`, `.` or `..` components, deduplicated and sorted.
+///
+/// # Errors
+///
+/// Fails on an empty, absolute or escaping entry.
+pub fn normalize_excludes(excludes: &[String]) -> Result<Vec<String>> {
+    let mut normalized: Vec<String> = Vec::new();
+    for raw in excludes {
+        let mut parts: Vec<String> = Vec::new();
+        for component in Path::new(raw.trim()).components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+                _ => bail!(
+                    "exclude '{raw}' must be a relative path inside the snapshot, without '..'"
+                ),
+            }
+        }
+        if parts.is_empty() {
+            bail!("exclude entries must be paths inside the snapshot, got '{raw}'");
+        }
+        let entry = parts.join("/");
+        if !normalized.contains(&entry) {
+            normalized.push(entry);
+        }
+    }
+    normalized.sort();
+
+    Ok(normalized)
+}
+
+/// Short id of an exclude list, used to keep one filtered copy per distinct list.
+#[must_use]
+pub fn exclude_hash(excludes: &[String]) -> String {
+    format!("{:x}", md5::compute(excludes.join("\n")))[..8].to_string()
+}
+
+/// Directory under the snapshots destination holding the filtered copies.
+#[must_use]
+pub fn staging_root(destination: &str) -> String {
+    format!("{}/.staging", strip_trailing_slash(destination))
+}
+
+/// Path of the filtered copy of `name` for an exclude list.
+#[must_use]
+pub fn staging_path(destination: &str, excludes: &[String], name: &str) -> String {
+    format!(
+        "{}/{}/{name}",
+        staging_root(destination),
+        exclude_hash(excludes)
+    )
+}
+
+/// What an exclude list removed (or would remove) from a snapshot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Excluded {
+    /// Entries that existed in the snapshot.
+    pub paths: usize,
+    /// Apparent size of the files under them.
+    pub bytes: u64,
+}
+
+/// Size of the excluded paths inside a snapshot, touching nothing (for `--dry-run`).
+///
+/// # Errors
+///
+/// Fails if the tree can't be read.
+pub fn measure_excludes(snapshot_path: &str, excludes: &[String]) -> Result<Excluded> {
+    let mut excluded = Excluded::default();
+    for entry in excludes {
+        if let Some(path) = locate_exclude(snapshot_path, entry)? {
+            excluded.paths += 1;
+            excluded.bytes += tree_size(&path)?;
+        }
+    }
+
+    Ok(excluded)
+}
+
+/// Locate an exclude entry inside a snapshot or filtered copy. The last component is not
+/// followed (a symlink is removed as a link), and the entry is refused when its parent resolves
+/// outside the root: a symlink inside the snapshot may point at the live system, and deleting
+/// through it would destroy live data. Returns `None` when the entry does not exist.
+fn locate_exclude(root: &str, entry: &str) -> Result<Option<PathBuf>> {
+    let full = Path::new(root).join(entry);
+    if full.symlink_metadata().is_err() {
+        return Ok(None);
+    }
+    let real_root = Path::new(root)
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {root}"))?;
+    let parent = full.parent().context("exclude entry without a parent")?;
+    let real_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", parent.display()))?;
+    if !real_parent.starts_with(&real_root) {
+        bail!(
+            "exclude '{entry}' resolves outside the snapshot ({}), refusing to touch it",
+            real_parent.display()
+        );
+    }
+    let name = full.file_name().context("exclude entry without a name")?;
+
+    Ok(Some(real_parent.join(name)))
+}
+
+fn tree_size(path: &Path) -> Result<u64> {
+    let metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if metadata.is_dir() {
+        let mut total = 0;
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            total += tree_size(&entry?.path())?;
+        }
+        Ok(total)
+    } else if metadata.is_file() {
+        Ok(metadata.len())
+    } else {
+        Ok(0)
+    }
+}
+
+/// Delete the excluded paths inside a filtered copy, returning what was removed. Entries that
+/// don't exist in the snapshot are ignored. Sizes come from a read-only walk; the deletion itself
+/// is done by the standard library, whose `remove_dir_all` never follows symlinks and is immune
+/// to a directory being swapped for a symlink while it runs.
+///
+/// # Errors
+///
+/// Fails if something can't be removed or an entry resolves outside the copy.
+pub fn remove_excludes(staging: &str, excludes: &[String]) -> Result<Excluded> {
+    let mut excluded = Excluded::default();
+    for entry in excludes {
+        if let Some(path) = locate_exclude(staging, entry)? {
+            excluded.paths += 1;
+            excluded.bytes += tree_size(&path)?;
+            let metadata = path
+                .symlink_metadata()
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if metadata.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            }
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+
+    Ok(excluded)
+}
+
+/// Build (or reuse) the filtered copy of a snapshot for a target: a read-write snapshot of the
+/// read-only snapshot, minus the excluded paths, set read-only so it can be sent. Returns its
+/// path and what was removed (`None` when an existing copy is reused).
+///
+/// # Errors
+///
+/// Fails if any btrfs command or deletion fails; a half-built copy is removed again.
+pub fn prepare_staging(
+    snapshot: &SnapshotRecord,
+    replication: &Replication,
+) -> Result<(String, Option<Excluded>)> {
+    let staging = staging_path(&snapshot.destination, &replication.exclude, &snapshot.name);
+    if Path::new(&staging).exists() {
+        if is_read_only(&staging)? {
+            return Ok((staging, None));
+        }
+        eprintln!("Warning: removing the incomplete filtered copy {staging}");
+        operations::del_snapshot(&staging)?;
+    }
+    if let Some(parent) = Path::new(&staging).parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    operations::run_btrfs(&strings(&[
+        "subvolume",
+        "snapshot",
+        &snapshot.path(),
+        &staging,
+    ]))?;
+    let excluded = match remove_excludes(&staging, &replication.exclude) {
+        Ok(excluded) => excluded,
+        Err(err) => {
+            let _ = operations::del_snapshot(&staging);
+            return Err(err)
+                .with_context(|| format!("failed to build the filtered copy {staging}"));
+        }
+    };
+    if let Err(err) = operations::run_btrfs(&strings(&[
+        "property", "set", "-ts", &staging, "ro", "true",
+    ])) {
+        let _ = operations::del_snapshot(&staging);
+        return Err(err);
+    }
+
+    Ok((staging, Some(excluded)))
+}
+
+fn is_read_only(path: &str) -> Result<bool> {
+    let output = Command::new("btrfs")
+        .args(["property", "get", "-ts", path, "ro"])
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to execute 'btrfs', make sure btrfs-progs is installed and in PATH")?;
+    if !output.status.success() {
+        bail!(
+            "'btrfs property get {path} ro' failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).contains("ro=true"))
+}
+
+fn describe_excluded(replication: &Replication, excluded: Option<Excluded>) -> String {
+    if replication.exclude.is_empty() {
+        return String::new();
+    }
+    match excluded {
+        Some(excluded) => format!(
+            ", excluding {} path(s), {}",
+            excluded.paths,
+            human_size(excluded.bytes)
+        ),
+        None => ", filtered copy reused".to_string(),
+    }
 }
 
 fn record(
@@ -870,6 +1133,7 @@ mod tests {
             target: target.into(),
             keep: None,
             ssh_options: ssh_options.iter().map(|o| (*o).to_string()).collect(),
+            exclude: Vec::new(),
         })
         .unwrap()
     }
@@ -981,5 +1245,105 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1_572_864), "1.5 MiB");
         assert_eq!(human_size(3 << 30), "3.0 GiB");
+    }
+}
+
+#[cfg(test)]
+mod exclude_tests {
+    use super::{
+        exclude_hash, measure_excludes, normalize_excludes, remove_excludes, staging_path,
+    };
+
+    fn list(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn normalize() {
+        assert_eq!(
+            normalize_excludes(&list(&[
+                "./cache/", "b", "cache", "a/b/", " vm ", "a/./b", "x//y"
+            ]))
+            .unwrap(),
+            ["a/b", "b", "cache", "vm", "x/y"]
+        );
+        for bad in ["", " ", "/abs", "../x", "a/../b", ".", "./"] {
+            assert!(normalize_excludes(&list(&[bad])).is_err(), "{bad:?}");
+        }
+        assert!(normalize_excludes(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn hash_and_staging_path() {
+        let a = normalize_excludes(&list(&["cache", "vm"])).unwrap();
+        let b = normalize_excludes(&list(&["vm", "cache/"])).unwrap();
+        assert_eq!(exclude_hash(&a), exclude_hash(&b));
+        assert_eq!(exclude_hash(&a).len(), 8);
+        assert_ne!(exclude_hash(&a), exclude_hash(&list(&["cache"])));
+        assert_eq!(
+            staging_path("/.snapshots/", &a, "root-1"),
+            format!("/.snapshots/.staging/{}/root-1", exclude_hash(&a))
+        );
+    }
+
+    #[test]
+    fn measure_and_remove() {
+        let dir = std::env::temp_dir().join(format!("rusnapshot-exclude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, size) in [
+            ("keep/a", 100),
+            ("cache/x/b", 300),
+            ("cache/c", 200),
+            ("top", 50),
+        ] {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, vec![0u8; size]).unwrap();
+        }
+        let excludes = normalize_excludes(&list(&["cache", "top", "missing/dir"])).unwrap();
+        let staging = dir.to_str().unwrap();
+
+        let measured = measure_excludes(staging, &excludes).unwrap();
+        assert_eq!((measured.paths, measured.bytes), (2, 550));
+        assert!(dir.join("cache/c").exists(), "measuring must not delete");
+
+        let removed = remove_excludes(staging, &excludes).unwrap();
+        assert_eq!((removed.paths, removed.bytes), (2, 550));
+        assert!(!dir.join("cache").exists());
+        assert!(!dir.join("top").exists());
+        assert!(dir.join("keep/a").exists());
+        assert_eq!(remove_excludes(staging, &excludes).unwrap().paths, 0);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn symlinks_never_lead_outside_the_snapshot() {
+        let base =
+            std::env::temp_dir().join(format!("rusnapshot-exclude-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let outside = base.join("outside");
+        let staging = base.join("staging");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(outside.join("sub/x"), vec![0u8; 100]).unwrap();
+        std::os::unix::fs::symlink(&outside, staging.join("link")).unwrap();
+        let root = staging.to_str().unwrap();
+
+        // Through the symlink: refused, nothing touched, nothing measured.
+        let through = normalize_excludes(&list(&["link/sub"])).unwrap();
+        let err = remove_excludes(root, &through).unwrap_err().to_string();
+        assert!(err.contains("outside the snapshot"), "{err}");
+        assert!(measure_excludes(root, &through).is_err());
+        assert!(outside.join("sub/x").exists());
+
+        // The symlink itself: removed as a link, the target is untouched.
+        let link = normalize_excludes(&list(&["link"])).unwrap();
+        let removed = remove_excludes(root, &link).unwrap();
+        assert_eq!((removed.paths, removed.bytes), (1, 0));
+        assert!(staging.join("link").symlink_metadata().is_err());
+        assert!(outside.join("sub/x").exists());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

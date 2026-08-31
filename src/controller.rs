@@ -1,7 +1,7 @@
 use {
     crate::{
         args::Args,
-        database, operations,
+        database, operations, replication,
         structs::{ReplicaRecord, SnapshotRecord},
         utils::strip_trailing_slash,
     },
@@ -251,6 +251,7 @@ fn delete_record(args: &Args, connection: &Connection, record: &SnapshotRecord) 
             record.name, record.snap_id
         );
     }
+    remove_filtered_copies(record);
     database::delete_snapshot(connection, record)?;
     if on_disk {
         println!("Snapshot {} ({}) deleted", record.name, record.snap_id);
@@ -264,6 +265,29 @@ fn delete_record(args: &Args, connection: &Connection, record: &SnapshotRecord) 
     Ok(())
 }
 
+/// Delete the filtered copies built for replication (`<destination>/.staging/*/<name>`) of a
+/// snapshot that is being deleted. Failures are reported but don't stop the deletion.
+fn remove_filtered_copies(record: &SnapshotRecord) {
+    let Ok(entries) = std::fs::read_dir(replication::staging_root(&record.destination)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let copy = entry.path().join(&record.name);
+        if !copy.exists() {
+            continue;
+        }
+        let copy = copy.to_string_lossy().into_owned();
+        match operations::del_snapshot(&copy) {
+            Ok(()) => {
+                println!("Deleted the filtered copy {copy}");
+                // The per-list directory is a plain directory; drop it once empty.
+                let _ = std::fs::remove_dir(entry.path());
+            }
+            Err(err) => eprintln!("Warning: {err:#}"),
+        }
+    }
+}
+
 fn print_replicas(replicas: &[ReplicaRecord]) {
     let mut table = Table::new();
     table.set_titles(row![
@@ -272,6 +296,7 @@ fn print_replicas(replicas: &[ReplicaRecord]) {
         "KIND",
         "MACHINE",
         "PARENT",
+        "FILTERED",
         "REPLICATED"
     ]);
     for replica in replicas {
@@ -281,6 +306,7 @@ fn print_replicas(replicas: &[ReplicaRecord]) {
             replica.kind,
             replica.machine,
             replica.parent_name.as_deref().unwrap_or("-"),
+            if replica.local_path.contains("/.staging/") { "yes" } else { "-" },
             replica.date,
         ]);
     }
