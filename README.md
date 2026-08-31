@@ -41,3 +41,11 @@ In summary, `busy_timeout` is the maximum time that SQLite will retry the failed
 ## Creating and restoring a snapshot
 
 ![Creating and restoring a snapshot](images/rusnapshot-creating-restoring.png)
+
+## Replicating to another host
+
+![Replicating to another host](images/rusnapshot-replica-create.png)
+
+## Restoring from a replica
+
+![Restoring from a replica](images/rusnapshot-replica-restore.png)
