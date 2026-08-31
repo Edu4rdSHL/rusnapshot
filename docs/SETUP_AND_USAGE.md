@@ -147,6 +147,7 @@ With `--target` on the command line use `--exclude PATH` (repeatable).
 - Incremental sends chain between filtered copies, so only the changes outside the excluded paths are sent. Changing the list does not force a full send.
 - Building a copy costs one deletion per file under the excluded paths (about 37k files per second on an NVMe drive; a `~/.cache` with 450k files takes about 12 seconds per snapshot). `--dry-run` prints how many paths and how many bytes would be left out, and every send reports what it excluded.
 - The local snapshots keep everything; only what leaves the machine is filtered, and a restore from a replica does not contain the excluded paths.
+- Files carrying the immutable or append-only attribute (`chattr +i`, `chattr +a`) can't be unlinked, not even by root, and snapshots inherit the attribute. When one shows up under an excluded path rusnapshot clears it inside the filtered copy and reports it as a warning. That copy is a throwaway subvolume under `.staging`: the snapshot it was made from is read-only and the live filesystem is never touched, so the file keeps its attribute everywhere it matters.
 - Directories that are nested subvolumes are already left out of snapshots (and so of replicas) by btrfs itself; converting a directory into a subvolume is the way to exclude it from the local snapshots too.
 
 `--list` prints the replicas present at each target below the snapshots table.
