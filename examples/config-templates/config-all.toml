@@ -32,3 +32,5 @@ keep = 30
 # needs passwordless sudo (or be root).
 # Extra ssh options, rusnapshot runs as root and does not see your ~/.ssh/config
 ssh_options = ["-i", "/root/.ssh/backup_key"]
+# Paths inside the snapshot to leave out of the replicas (relative to the snapshot root)
+exclude = ["edu4rdshl/.cache"]

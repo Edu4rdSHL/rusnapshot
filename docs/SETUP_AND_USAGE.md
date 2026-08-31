@@ -131,6 +131,24 @@ Requirements: the target directory must already exist on a btrfs filesystem (rus
 
 Keep the local retention (`keep_only`) at 2 or more when replicating: if `--clean` deletes the newest replicated snapshot before the next send, that send has no parent and is full again.
 
+### Leaving paths out of the replicas
+
+`btrfs send` always sends a whole subvolume, so when a target has `exclude` entries rusnapshot sends a filtered copy instead of the snapshot: a read-write snapshot of the snapshot from which the excluded paths are deleted, then set read-only. Paths are relative to the root of the source subvolume.
+
+```toml
+[[replicate]]
+target = "ssh://backup@nas/srv/backups/behemoth"
+exclude = ["edu4rdshl/.cache", "edu4rdshl/Games", "edu4rdshl/.local/share/Steam/steamapps/common"]
+```
+
+With `--target` on the command line use `--exclude PATH` (repeatable).
+
+- The filtered copies live in `<dest_dir>/.staging/<id>/<snapshot name>`, one `<id>` per distinct exclude list, and are deleted together with their snapshot by `--del` and `--clean`. While the snapshot exists they share every extent with it and only cost metadata.
+- Incremental sends chain between filtered copies, so only the changes outside the excluded paths are sent. Changing the list does not force a full send.
+- Building a copy costs one deletion per file under the excluded paths (about 37k files per second on an NVMe drive; a `~/.cache` with 450k files takes about 12 seconds per snapshot). `--dry-run` prints how many paths and how many bytes would be left out, and every send reports what it excluded.
+- The local snapshots keep everything; only what leaves the machine is filtered, and a restore from a replica does not contain the excluded paths.
+- Directories that are nested subvolumes are already left out of snapshots (and so of replicas) by btrfs itself; converting a directory into a subvolume is the way to exclude it from the local snapshots too.
+
 `--list` prints the replicas present at each target below the snapshots table.
 
 ## Exit codes
