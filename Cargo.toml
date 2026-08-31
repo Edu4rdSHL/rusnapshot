@@ -17,6 +17,7 @@ prettytable-rs = "0.10.0"
 anyhow = "1.0.104"
 toml = "1.1.4"
 hostname = "0.4.2"
+libc = "0.2.189"
 
 [profile.release]
 lto = true

@@ -15,13 +15,23 @@ use {
     anyhow::{Context, Result, anyhow, bail},
     sqlite::Connection,
     std::{
-        fs,
+        ffi::CString,
+        fs, io,
         io::{IsTerminal, Read, Write},
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
         path::{Component, Path, PathBuf},
         process::{Command, Stdio},
         time::{Duration, Instant},
     },
 };
+
+/// `FS_IMMUTABLE_FL` from `linux/fs.h`: the file can't be written, deleted or renamed.
+const FS_IMMUTABLE_FL: libc::c_int = 0x0000_0010;
+/// `FS_APPEND_FL` from `linux/fs.h`: the file can only be opened for appending.
+const FS_APPEND_FL: libc::c_int = 0x0000_0020;
 
 /// Identity of a subvolume as reported by `btrfs subvolume show`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,16 +943,125 @@ pub fn remove_excludes(staging: &str, excludes: &[String]) -> Result<Excluded> {
             let metadata = path
                 .symlink_metadata()
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            if metadata.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            }
-            .with_context(|| format!("failed to remove {}", path.display()))?;
+            remove_excluded(&path, metadata.is_dir())
+                .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
 
     Ok(excluded)
+}
+
+/// Remove one excluded entry. The fast path is the standard library, which handles every ordinary
+/// tree; when something below carries the immutable or append-only attribute the kernel refuses
+/// the `unlink` with `EPERM` even for root, and the tree is walked again clearing the attribute
+/// from whatever refuses to go away.
+///
+/// Clearing only ever happens inside the throwaway read-write copy under `.staging`: the snapshot
+/// it was made from is read-only and the live filesystem is never reached, so a file protected
+/// with `chattr +i` keeps its attribute everywhere it matters.
+fn remove_excluded(path: &Path, is_dir: bool) -> io::Result<()> {
+    let removed = if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removed {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => force_remove(path),
+        other => other,
+    }
+}
+
+/// Remove `path` and everything under it, clearing attributes as needed. Symlinks are removed as
+/// links: the type comes from `symlink_metadata`, so the walk never descends through one.
+fn force_remove(path: &Path) -> io::Result<()> {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        // `remove_dir_all` deletes as it goes, so part of the tree is already gone.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            force_remove(&entry?.path())?;
+        }
+    }
+
+    unlink(path, metadata.is_dir())
+}
+
+/// `unlink` or `rmdir`, retried once with the immutable and append-only attributes cleared from
+/// the entry and from the directory holding it: either of the two is enough to stop a removal,
+/// and an immutable directory is what stops an otherwise ordinary file from going away. Only the
+/// paths that really carried an attribute are reported, and a failure to clear is ignored so the
+/// caller sees the original removal error rather than a derived one.
+fn unlink(path: &Path, is_dir: bool) -> io::Result<()> {
+    let remove = || {
+        if is_dir {
+            fs::remove_dir(path)
+        } else {
+            fs::remove_file(path)
+        }
+    };
+    match remove() {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let mut cleared: Vec<&Path> = Vec::new();
+            if clear_attributes(path).unwrap_or(false) {
+                cleared.push(path);
+            }
+            if let Some(parent) = path.parent()
+                && clear_attributes(parent).unwrap_or(false)
+            {
+                cleared.push(parent);
+            }
+            let result = remove();
+            if result.is_ok() {
+                for cleared in cleared {
+                    eprintln!(
+                        "Warning: cleared the immutable/append-only attribute of {} in the filtered copy",
+                        cleared.display()
+                    );
+                }
+            }
+            result
+        }
+        other => other,
+    }
+}
+
+/// Clear `FS_IMMUTABLE_FL` and `FS_APPEND_FL` on a path, reporting whether either of them was
+/// actually set: the caller uses that to name what it really touched. `O_NOFOLLOW` means a
+/// symlink inside the copy can never redirect this at something else.
+fn clear_attributes(path: &Path) -> io::Result<bool> {
+    let name = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
+    let raw = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just opened here and is owned by nothing else.
+    let file = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let mut flags: libc::c_int = 0;
+    // SAFETY: the descriptor is open and the kernel writes one `int` through the pointer.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let wanted = flags & !(FS_IMMUTABLE_FL | FS_APPEND_FL);
+    if wanted == flags {
+        return Ok(false);
+    }
+    // SAFETY: the descriptor is open and the kernel reads one `int` through the pointer.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &raw const wanted) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(true)
 }
 
 /// Build (or reuse) the filtered copy of a snapshot for a target: a read-write snapshot of the
@@ -1250,12 +1369,50 @@ mod tests {
 
 #[cfg(test)]
 mod exclude_tests {
-    use super::{
-        exclude_hash, measure_excludes, normalize_excludes, remove_excludes, staging_path,
+    use {
+        super::{
+            FS_IMMUTABLE_FL, clear_attributes, exclude_hash, measure_excludes, normalize_excludes,
+            remove_excludes, staging_path,
+        },
+        std::{
+            ffi::CString,
+            os::{
+                fd::{AsRawFd, FromRawFd, OwnedFd},
+                unix::ffi::OsStrExt,
+            },
+            path::Path,
+        },
     };
 
     fn list(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// Set `FS_IMMUTABLE_FL` on a path. This needs `CAP_LINUX_IMMUTABLE` and a filesystem that
+    /// supports the attribute, so it reports whether it worked and the test skips when it did
+    /// not: an unprivileged `cargo test` has nothing to check here.
+    fn set_immutable(path: &Path) -> bool {
+        let Ok(name) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
+        let raw = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if raw < 0 {
+            return false;
+        }
+        // SAFETY: `raw` was just opened here and is owned by nothing else.
+        let file = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut flags: libc::c_int = 0;
+        // SAFETY: the descriptor is open and the kernel writes one `int` through the pointer.
+        if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } < 0 {
+            return false;
+        }
+        let wanted = flags | FS_IMMUTABLE_FL;
+        // SAFETY: the descriptor is open and the kernel reads one `int` through the pointer.
+        let set =
+            unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &raw const wanted) };
+
+        set == 0
     }
 
     #[test]
@@ -1345,5 +1502,73 @@ mod exclude_tests {
         assert!(outside.join("sub/x").exists());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn clearing_attributes_never_follows_a_symlink() {
+        let base =
+            std::env::temp_dir().join(format!("rusnapshot-exclude-attr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // A file with neither attribute set: nothing to clear, and it says so.
+        assert!(!clear_attributes(&target).unwrap());
+        // Through a symlink: refused by O_NOFOLLOW instead of reaching whatever it points at.
+        assert!(clear_attributes(&link).is_err());
+        assert!(target.exists());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn removes_an_immutable_file_under_an_excluded_path() {
+        let dir =
+            std::env::temp_dir().join(format!("rusnapshot-exclude-imm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache/sub")).unwrap();
+        std::fs::write(dir.join("cache/sub/locked"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("keep"), vec![0u8; 10]).unwrap();
+
+        if !set_immutable(&dir.join("cache/sub/locked")) {
+            // Unprivileged run or a filesystem without the attribute: nothing to exercise.
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let excludes = normalize_excludes(&list(&["cache"])).unwrap();
+        let removed = remove_excludes(dir.to_str().unwrap(), &excludes).unwrap();
+        assert_eq!((removed.paths, removed.bytes), (1, 100));
+        assert!(!dir.join("cache").exists());
+        assert!(dir.join("keep").exists(), "only the excluded path goes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn removes_the_contents_of_an_immutable_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("rusnapshot-exclude-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache/locked")).unwrap();
+        std::fs::write(dir.join("cache/locked/inside"), vec![0u8; 40]).unwrap();
+        std::fs::write(dir.join("keep"), vec![0u8; 10]).unwrap();
+
+        // The file is ordinary here: what refuses the removal is the directory holding it.
+        if !set_immutable(&dir.join("cache/locked")) {
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+
+        let excludes = normalize_excludes(&list(&["cache"])).unwrap();
+        let removed = remove_excludes(dir.to_str().unwrap(), &excludes).unwrap();
+        assert_eq!((removed.paths, removed.bytes), (1, 40));
+        assert!(!dir.join("cache").exists());
+        assert!(dir.join("keep").exists(), "only the excluded path goes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
