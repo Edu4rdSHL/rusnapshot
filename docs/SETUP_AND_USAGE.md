@@ -48,6 +48,10 @@
 
 `sudo rusnapshot --id {{snapshot_id}} --restore --to {{/path/to/restore}}`
 
+- Restore a snapshot that is no longer here from a replica at a target (see Restoring below):
+
+`sudo rusnapshot -c {{path/to/config.toml}} --restore --id {{snapshot_id}} --from-replica --to {{/path/to/restore}}`
+
 - Replicate the snapshots to the targets defined in the config file (see Replication below):
 
 `sudo rusnapshot -c {{path/to/config.toml}} --send`
@@ -91,6 +95,23 @@ sudo rusnapshot --id {{snapshot_id}} --restore
 ```
 
 Use `--to` to restore somewhere else. Restoring the root subvolume in place requires booting from another system or mounting the top-level subvolume, since `/` can't be moved while in use.
+
+### Restoring from a replica
+
+When the snapshot is no longer on this machine but a replica of it still is at a target, `--from-replica` brings it back. The target is not given: replicas are recorded, so it is looked up.
+
+```
+sudo rusnapshot -c {{path/to/config.toml}} --restore --id {{snapshot_id}} --from-replica --to /mnt/rescue
+```
+
+The replica is received into `<dest_dir>/.restore/`, its identity is checked against the one at the target, and the restore is taken from it. The received copy is dropped afterwards: it shares its extents with the restore, so nothing is lost and no untracked subvolume is left behind.
+
+- When several targets hold a replica of the snapshot, the error lists them and one is given as the value: `--from-replica ssh://backup@nas:2222/srv/backups/behemoth`. The same works for a target the database does not know about.
+- The `ssh_options` of the matching `[[replicate]]` section are reused, so a restore needs no extra configuration. A target that is not in the file works too, with no options.
+- If the snapshot is still on this machine nothing is transferred: it says so and points at plain `--restore`.
+- **A replica sent with `exclude` does not contain the excluded paths, and neither will the restore.** Rusnapshot warns before and after when that is the case, but a home restored this way is missing whatever the target left out.
+- `--dry-run` prints what would be received and where, without contacting the target.
+- The transfer is always full. Restoring the difference from a snapshot already here is not implemented yet.
 
 ## Replication
 
