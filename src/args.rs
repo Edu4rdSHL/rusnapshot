@@ -121,16 +121,24 @@ impl Args {
     /// Fails if the matches can't be converted or the configuration file can't be read or parsed.
     pub fn from_matches(matches: &ArgMatches) -> Result<Self> {
         let mut args = Self::from_arg_matches(matches)?;
+        let from_command_line = |id: &str| {
+            matches.try_contains_id(id).is_ok()
+                && matches!(
+                    matches.value_source(id),
+                    Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+                )
+        };
         if let Some(path) = args.config_file.clone() {
             let config = Config::from_file(&path)?;
             // Options that only exist in the file (such as `replicate`) have no clap id.
-            config.merge_into(&mut args, |id| {
-                matches.try_contains_id(id).is_ok()
-                    && matches!(
-                        matches.value_source(id),
-                        Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-                    )
-            });
+            config.merge_into(&mut args, from_command_line);
+        }
+        // `dest_dir` is `--to` on the command line and the snapshots directory in the file, and
+        // for a restore only the first one makes sense: restoring into the directory that holds
+        // the snapshots is never what was meant. Dropping it here brings back the documented
+        // behaviour of restoring to the directory the snapshot was taken from.
+        if args.restore_snapshot && !from_command_line("dest_dir") {
+            args.dest_dir.clear();
         }
         if let Some(target) = &args.target {
             args.replicate = vec![ReplicateConfig {
@@ -471,6 +479,49 @@ target = 3
 
     /// The precedence logic relies on the clap argument ids being the field names, for every
     /// option that can also come from the configuration file.
+    #[test]
+    fn the_file_dest_dir_is_never_a_restore_target() {
+        let dir =
+            std::env::temp_dir().join(format!("rusnapshot-restore-to-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        std::fs::write(&file, FULL).unwrap();
+        let file = file.to_str().unwrap();
+
+        // With --restore the file's dest_dir is where the snapshots live, not a place to restore
+        // to, so it is dropped and the controller falls back to the recorded source.
+        let matches = Args::command()
+            .try_get_matches_from(["rusnapshot", "-c", file, "--restore", "--id", "abc"])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.dest_dir, "");
+
+        // An explicit --to still wins.
+        let matches = Args::command()
+            .try_get_matches_from([
+                "rusnapshot",
+                "-c",
+                file,
+                "--restore",
+                "--id",
+                "abc",
+                "--to",
+                "/mnt/rescue",
+            ])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.dest_dir, "/mnt/rescue");
+
+        // Any other operation keeps it: that is where snapshots go.
+        let matches = Args::command()
+            .try_get_matches_from(["rusnapshot", "-c", file, "--create"])
+            .unwrap();
+        let args = Args::from_matches(&matches).unwrap();
+        assert_eq!(args.dest_dir, "/.snapshots");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn from_matches_applies_precedence_for_every_option() {
         let dir = std::env::temp_dir().join(format!("rusnapshot-args-{}", std::process::id()));
