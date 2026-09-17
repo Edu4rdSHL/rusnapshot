@@ -52,6 +52,10 @@
 
 `sudo rusnapshot -c {{path/to/config.toml}} --restore --id {{snapshot_id}} --from-replica --to {{/path/to/restore}}`
 
+- Delete a replica at its target, leaving the local snapshot alone:
+
+`sudo rusnapshot -c {{path/to/config.toml}} --del --id {{snapshot_id}} --from-replica`
+
 - Replicate the snapshots to the targets defined in the config file (see Replication below):
 
 `sudo rusnapshot -c {{path/to/config.toml}} --send`
@@ -98,7 +102,7 @@ Use `--to` to restore somewhere else. Restoring the root subvolume in place requ
 
 ### Restoring from a replica
 
-When the snapshot is no longer on this machine but a replica of it still is at a target, `--from-replica` brings it back. The target is not given: replicas are recorded, so it is looked up.
+When the snapshot is no longer on this machine but a replica of it still is at a target, `--from-replica` brings it back. The target is not given: replicas are recorded, so it is looked up. `--id` is looked up among the replicas too, so a snapshot that is no longer tracked here, rotated out by `--clean` for instance, can be restored as long as its replica exists. Without `--to` the restore goes to the directory the snapshot was taken from.
 
 ```
 sudo rusnapshot -c {{path/to/config.toml}} --restore --id {{snapshot_id}} --from-replica --to /mnt/rescue
@@ -112,6 +116,20 @@ The replica is received into `<dest_dir>/.restore/`, its identity is checked aga
 - **A replica sent with `exclude` does not contain the excluded paths, and neither will the restore.** Rusnapshot warns before and after when that is the case, but a home restored this way is missing whatever the target left out.
 - `--dry-run` prints what would be received and where, without contacting the target.
 - The transfer is always full. Restoring the difference from a snapshot already here is not implemented yet.
+
+### Deleting a replica
+
+`--del` works on the local snapshot. With `--from-replica` it works on the replica instead: it is deleted at the target and nothing on this machine is touched.
+
+```
+sudo rusnapshot -c {{path/to/config.toml}} --del --id {{snapshot_id}} --from-replica
+```
+
+- The replica is remembered as deleted, the same as the ones removed by `keep`, so a snapshot still on this machine is not sent there again.
+- The target is resolved the same way as for a restore: looked up when a single one holds a replica, given as the value otherwise.
+- A replica recorded in the database but already gone from the target is only removed from the database, with a warning.
+- Deleting the newest replica is allowed. The next send uses the newest one that is left as its parent, and is full if none is.
+- `--dry-run` prints what would be deleted.
 
 ## Replication
 
