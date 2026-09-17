@@ -2153,3 +2153,172 @@ fn restore_from_a_replica_brings_the_snapshot_back() {
     );
     assert!(!other.exists());
 }
+
+#[test]
+fn delete_a_replica_leaves_the_snapshot_and_is_not_sent_again() {
+    let sb = Sandbox::new("del-replica");
+    write_blob(&sb.src.join("keep/a.bin"), 1);
+    let config = exclude_config(&sb, sb.target_str(), "\"cache\"");
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let record = sb.records().remove(0);
+    assert!(sb.run(&["-c", &config, "--send"]).status.success());
+    let replica = sb.target.join(&record.name);
+    assert!(replica.exists());
+
+    let del = [
+        "-c",
+        config.as_str(),
+        "--del",
+        "--id",
+        record.snap_id.as_str(),
+        "--from-replica",
+    ];
+    let mut dry = del.to_vec();
+    dry.push("--dry-run");
+    let output = sb.run(&dry);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("would delete replica"),
+        "{}",
+        text(&output)
+    );
+    assert!(replica.exists(), "a dry run deletes nothing");
+
+    let output = sb.run(&del);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(!text(&output).contains("Warning"), "{}", text(&output));
+    assert!(!replica.exists(), "the replica is gone at the target");
+    assert!(
+        Path::new(&record.path()).exists(),
+        "the local snapshot is untouched"
+    );
+    assert!(sb.replicas().is_empty(), "{:?}", sb.replicas());
+
+    // Remembered as pruned, so the snapshot that is still here is not sent there again.
+    let output = sb.run(&["-c", &config, "--send"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        stdout(&output).contains("Nothing to send"),
+        "{}",
+        text(&output)
+    );
+    assert!(!replica.exists());
+
+    let output = sb.run(&del);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("no replica of"), "{}", text(&output));
+
+    // A replica already gone from the target is only forgotten, with a warning.
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let second = sb
+        .records()
+        .into_iter()
+        .find(|r| r.name != record.name)
+        .unwrap();
+    assert!(sb.run(&["-c", &config, "--send"]).status.success());
+    fs::remove_dir_all(sb.target.join(&second.name)).unwrap();
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--del",
+        "--id",
+        &second.name,
+        "--from-replica",
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("already gone"), "{}", text(&output));
+    assert!(sb.replicas().is_empty(), "{:?}", sb.replicas());
+
+    let output = sb.run(&["-c", &config, "--list", "--from-replica"]);
+    assert!(!output.status.success(), "{}", text(&output));
+}
+
+#[test]
+fn restore_a_replica_whose_snapshot_is_no_longer_tracked() {
+    let sb = Sandbox::new("restore-untracked");
+    write_blob(&sb.src.join("keep/a.bin"), 1);
+    write_blob(&sb.src.join("cache/b.bin"), 1);
+    let config = exclude_config(&sb, sb.target_str(), "\"cache\"");
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let record = sb.records().remove(0);
+    assert!(sb.run(&["-c", &config, "--send"]).status.success());
+
+    // Rotated out here: the snapshot and its row are gone, the replica is all that is left.
+    let output = sb.run(&["-c", &config, "--del", "--id", &record.snap_id]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(sb.records().is_empty());
+    assert_eq!(sb.replicas().len(), 1);
+
+    // Without --to the restore goes back to the directory the snapshot was taken from.
+    fs::rename(&sb.src, sb.dir.join("src.old")).unwrap();
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--restore",
+        "--id",
+        &record.name,
+        "--from-replica",
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(sb.src.join("keep/a.bin").exists(), "{}", text(&output));
+    assert!(!sb.src.join("cache").exists());
+    assert!(
+        text(&output).contains("was sent from a filtered copy"),
+        "{}",
+        text(&output)
+    );
+    assert!(!sb.snaps.join(".restore").exists());
+}
+
+#[test]
+fn delete_a_replica_held_by_several_targets_needs_the_target() {
+    let sb = Sandbox::new("del-replica-two");
+    write_blob(&sb.src.join("a.bin"), 1);
+    let second = sb.dir.join("target2");
+    fs::create_dir_all(&second).unwrap();
+    let config = sb.write(
+        "two.toml",
+        &format!(
+            "dest_dir = \"{}\"\nsource_dir = \"{}\"\ndatabase_file = \"{}\"\nsnapshot_prefix = \"p\"\nmachine = \"test\"\n\n[[replicate]]\ntarget = \"{}\"\n\n[[replicate]]\ntarget = \"{}\"\n",
+            sb.snaps.display(),
+            sb.src.display(),
+            sb.db.display(),
+            sb.target.display(),
+            second.display()
+        ),
+    );
+    assert!(sb.run(&["-c", &config, "--create"]).status.success());
+    let record = sb.records().remove(0);
+    assert!(sb.run(&["-c", &config, "--send"]).status.success());
+    assert!(sb.target.join(&record.name).exists() && second.join(&record.name).exists());
+
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--del",
+        "--id",
+        &record.name,
+        "--from-replica",
+    ]);
+    assert!(!output.status.success(), "{}", text(&output));
+    let out = text(&output);
+    assert!(
+        out.contains("several targets") && out.contains(second.to_str().unwrap()),
+        "{out}"
+    );
+    assert!(sb.target.join(&record.name).exists() && second.join(&record.name).exists());
+
+    let output = sb.run(&[
+        "-c",
+        &config,
+        "--del",
+        "--id",
+        &record.name,
+        "--from-replica",
+        second.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(!second.join(&record.name).exists());
+    assert!(sb.target.join(&record.name).exists());
+    assert_eq!(sb.replicas().len(), 1);
+}

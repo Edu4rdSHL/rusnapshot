@@ -73,12 +73,16 @@ pub fn manage_creation(args: &Args, connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Delete the snapshot given with `--id`.
+/// Delete the snapshot given with `--id`, or with `--from-replica` its replica at the target.
 ///
 /// # Errors
 ///
 /// Fails if the id is unknown or ambiguous, or the deletion fails.
 pub fn manage_deletion(args: &Args, connection: &Connection) -> Result<()> {
+    if let Some(target) = &args.from_replica {
+        return delete_remote_replica(args, connection, target);
+    }
+
     let record = find_one(connection, &args.snapshot_id)?;
 
     delete_record(args, connection, &record)
@@ -90,17 +94,13 @@ pub fn manage_deletion(args: &Args, connection: &Connection) -> Result<()> {
 ///
 /// Fails if the id is unknown or ambiguous, the target exists or the restore fails.
 pub fn manage_restoring(args: &Args, connection: &Connection) -> Result<()> {
+    if let Some(target) = &args.from_replica {
+        return restore_from_replica(args, connection, target);
+    }
+
     let record = find_one(connection, &args.snapshot_id)?;
     let snapshot = record.path();
-    let target = if args.dest_dir.is_empty() {
-        strip_trailing_slash(&record.source).to_string()
-    } else {
-        strip_trailing_slash(&args.dest_dir).to_string()
-    };
-
-    if let Some(source) = &args.from_replica {
-        return restore_from_replica(args, connection, &record, &target, source);
-    }
+    let target = restore_target(args, &record.source);
 
     if args.dry_run {
         println!(
@@ -125,63 +125,62 @@ pub fn manage_restoring(args: &Args, connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Where a restore goes: `--to` when given, else the directory the snapshot was taken from.
+fn restore_target(args: &Args, source: &str) -> String {
+    if args.dest_dir.is_empty() {
+        strip_trailing_slash(source).to_string()
+    } else {
+        strip_trailing_slash(&args.dest_dir).to_string()
+    }
+}
+
 /// Restore a snapshot from one of its replicas: it is brought back with `btrfs send`/`btrfs
 /// receive` into `<dest_dir>/.restore/`, verified against the target, and the restored copy is
 /// taken from it. The received subvolume is deleted afterwards; the restored copy keeps the data
 /// because they share their extents.
 ///
-/// An empty `source` means the target is looked up in the database, which only works when a
-/// single one holds a replica of this snapshot.
+/// The replica is looked up in the replicas table, so a snapshot no longer tracked on this
+/// machine, rotated out by `--clean` for instance, can still be restored as long as its replica
+/// is there. An empty `target` means the one recorded for it.
 ///
 /// # Errors
 ///
-/// Fails if the snapshot is already here, the restore target exists, the target can't be
-/// resolved, the replica is missing there, or the transfer or the verification fails.
-fn restore_from_replica(
-    args: &Args,
-    connection: &Connection,
-    record: &SnapshotRecord,
-    target: &str,
-    source: &str,
-) -> Result<()> {
-    let local = record.path();
+/// Fails if the replica can't be resolved, the snapshot is already here, the restore target
+/// exists, the replica is missing at the target, or the transfer or the verification fails.
+fn restore_from_replica(args: &Args, connection: &Connection, target: &str) -> Result<()> {
+    let replica = find_replica(connection, &args.snapshot_id, target, true)?;
+    let restore_to = restore_target(args, &replica.source);
+    let snapshots = snapshots_dir(&replica);
+    let local = format!("{}/{}", strip_trailing_slash(&snapshots), replica.name);
     if Path::new(&local).exists() {
         bail!(
             "{} is already on this machine at {local}. Restore it with --restore --id {} and no --from-replica",
-            record.name,
-            record.snap_id
+            replica.name,
+            replica.snap_id
         );
     }
-    if Path::new(target).exists() {
+    if Path::new(&restore_to).exists() {
         bail!(
-            "the restore target {target} already exists. Move it out of the way first (for example: mv {target} {target}.old) or restore somewhere else with --to"
+            "the restore target {restore_to} already exists. Move it out of the way first (for example: mv {restore_to} {restore_to}.old) or restore somewhere else with --to"
         );
     }
 
-    let source = if source.is_empty() {
-        recorded_target(connection, record)?
-    } else {
-        source.to_string()
-    };
-    let replication = external_replication(args, &source)?;
-    let remote = replication.subvolume_path(&record.name);
-    let filtered = was_filtered(connection, &record.name, &replication.url);
+    let replication = external_replication(args, &replica.target)?;
+    let remote = replication.subvolume_path(&replica.name);
+    let filtered = replica.local_path.contains("/.staging/");
     if filtered {
         eprintln!(
             "Warning: the replica of {} at {} was sent from a filtered copy, so it does not contain the paths excluded for that target. The restore will be missing them.",
-            record.name, replication.url
+            replica.name, replication.url
         );
     }
 
-    let staging = format!(
-        "{}/.restore",
-        strip_trailing_slash(&record.destination.clone())
-    );
-    let received = format!("{staging}/{}", record.name);
+    let staging = format!("{}/.restore", strip_trailing_slash(&snapshots));
+    let received = format!("{staging}/{}", replica.name);
 
     if args.dry_run {
         println!(
-            "[dry-run] would receive {remote} from {} into {staging} and restore it to {target}",
+            "[dry-run] would receive {remote} from {} into {staging} and restore it to {restore_to}",
             replication.url
         );
         return Ok(());
@@ -201,9 +200,9 @@ fn restore_from_replica(
 
     println!(
         "Receiving {} from {} into {staging}",
-        record.name, replication.url
+        replica.name, replication.url
     );
-    let transfer = match replication::receive_from_target(&replication, &record.name, &staging) {
+    let transfer = match replication::receive_from_target(&replication, &replica.name, &staging) {
         Ok(transfer) => transfer,
         Err(err) => {
             let _ = operations::del_snapshot(&received);
@@ -225,7 +224,7 @@ fn restore_from_replica(
         } else {
             bail!(
                 "verification of {} failed: received UUID {} does not match the UUID {expected} of {remote} at {}",
-                record.name,
+                replica.name,
                 info.received_uuid.as_deref().unwrap_or("-"),
                 replication.url
             )
@@ -238,10 +237,10 @@ fn restore_from_replica(
 
     let seconds = transfer.elapsed.as_secs_f64().max(0.001);
     println!(
-        "Received {} in {seconds:.1}s, restoring to {target}",
+        "Received {} in {seconds:.1}s, restoring to {restore_to}",
         replication::human_size(transfer.bytes)
     );
-    if let Err(err) = operations::restore_snapshot(&received, target) {
+    if let Err(err) = operations::restore_snapshot(&received, &restore_to) {
         let _ = operations::del_snapshot(&received);
         return Err(err);
     }
@@ -253,7 +252,7 @@ fn restore_from_replica(
     }
     let _ = std::fs::remove_dir(&staging);
 
-    println!("The snapshot was successfully restored to {target}");
+    println!("The snapshot was successfully restored to {restore_to}");
     if filtered {
         println!(
             "Remember that the paths excluded for {} are not in it.",
@@ -264,39 +263,111 @@ fn restore_from_replica(
     Ok(())
 }
 
-/// Target holding the replica of `record`, from the database. The whole point of `--from-replica`
-/// without a value: the replicas are already recorded, so the target does not have to be typed
-/// again.
+/// Delete the replica named by `--id` at its target and remember it as pruned, as the target
+/// retention does, so the snapshot is not sent there again. Nothing on this machine is touched.
 ///
 /// # Errors
 ///
-/// Fails when no replica of the snapshot is recorded, or when several targets hold one and there
-/// is no way to tell which is meant.
-fn recorded_target(connection: &Connection, record: &SnapshotRecord) -> Result<String> {
-    let mut targets: Vec<String> = database::list_replicas(connection)?
-        .into_iter()
-        .filter(|replica| replica.snap_id == record.snap_id)
-        .map(|replica| replica.target)
-        .collect();
-    targets.sort();
-    targets.dedup();
+/// Fails if the replica can't be resolved or the target can't be reached.
+fn delete_remote_replica(args: &Args, connection: &Connection, target: &str) -> Result<()> {
+    let replica = find_replica(connection, &args.snapshot_id, target, false)?;
+    let replication = external_replication(args, &replica.target)?;
+    let remote = replication.subvolume_path(&replica.name);
+    if args.dry_run {
+        println!(
+            "[dry-run] would delete replica {} at {}",
+            replica.name, replication.url
+        );
+        return Ok(());
+    }
 
-    match targets.len() {
-        0 => bail!(
-            "no replica of {} is recorded. Give the target with --from-replica <TARGET>",
-            record.name
+    if replication.exists(&remote)? {
+        replication.delete_subvolume(&remote)?;
+        database::mark_replica_pruned(connection, &replica)?;
+        println!("Replica {} deleted at {}", replica.name, replication.url);
+    } else {
+        database::mark_replica_pruned(connection, &replica)?;
+        eprintln!(
+            "Warning: {remote} was already gone from {}, the replica is removed from the database only",
+            replication.url
+        );
+    }
+
+    Ok(())
+}
+
+/// The replica named by `--id`, a snapshot name or id, when `--from-replica` is given. Replicas
+/// have their own table, so a snapshot no longer tracked on this machine is still found. An empty
+/// `target` accepts any of them and fails when several targets hold one.
+///
+/// With `untracked_target`, a target with no record of the snapshot is accepted as long as the
+/// snapshot is still tracked here: a restore from a disk this database never sent to.
+///
+/// # Errors
+///
+/// Fails when nothing matches or the match is ambiguous.
+fn find_replica(
+    connection: &Connection,
+    id_or_name: &str,
+    target: &str,
+    untracked_target: bool,
+) -> Result<ReplicaRecord> {
+    let mut found: Vec<ReplicaRecord> = database::list_replicas(connection)?
+        .into_iter()
+        .filter(|replica| {
+            (replica.name == id_or_name || replica.snap_id == id_or_name)
+                && (target.is_empty() || replica.target == target)
+        })
+        .collect();
+
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 if untracked_target && !target.is_empty() => {
+            let record = find_one(connection, id_or_name)?;
+            Ok(ReplicaRecord {
+                local_path: record.path(),
+                name: record.name,
+                snap_id: record.snap_id,
+                target: target.to_string(),
+                source: record.source,
+                kind: record.kind,
+                machine: record.machine,
+                snapshot_date: record.date,
+                parent_name: None,
+                date: String::new(),
+            })
+        }
+        0 if untracked_target => bail!(
+            "no replica of '{id_or_name}' is recorded. If it is at a target the database does not know about, give it with --from-replica <TARGET>"
         ),
-        1 => Ok(targets.remove(0)),
-        _ => bail!(
-            "{} is replicated to several targets, pick one with --from-replica <TARGET>: {}",
-            record.name,
-            targets.join(", ")
-        ),
+        0 if target.is_empty() => bail!("no replica of '{id_or_name}' is recorded"),
+        0 => bail!("no replica of '{id_or_name}' is recorded at {target}"),
+        _ => {
+            let mut targets: Vec<String> =
+                found.into_iter().map(|replica| replica.target).collect();
+            targets.sort();
+            bail!(
+                "'{id_or_name}' is replicated to several targets, pick one with --from-replica <TARGET>: {}",
+                targets.join(", ")
+            )
+        }
     }
 }
 
+/// Directory holding the snapshots a replica was sent from. Its `local_path` is either the
+/// snapshot, `<dest_dir>/<name>`, or its filtered copy, `<dest_dir>/.staging/<id>/<name>`.
+fn snapshots_dir(replica: &ReplicaRecord) -> String {
+    if let Some((dir, _)) = replica.local_path.rsplit_once("/.staging/") {
+        return dir.to_string();
+    }
+    Path::new(&replica.local_path)
+        .parent()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Replication for a `--from-replica` target: reuses the `ssh_options` of the matching
-/// `[[replicate]]` section so a restore needs no extra configuration.
+/// `[[replicate]]` section so no extra configuration is needed.
 fn external_replication(args: &Args, source: &str) -> Result<replication::Replication> {
     let config = args
         .replicate
@@ -309,17 +380,6 @@ fn external_replication(args: &Args, source: &str) -> Result<replication::Replic
         });
 
     replication::Replication::from_config(&config)
-}
-
-/// Whether the replica of `name` at `target` was sent from a filtered copy.
-fn was_filtered(connection: &Connection, name: &str, target: &str) -> bool {
-    database::list_replicas(connection).is_ok_and(|replicas| {
-        replicas.iter().any(|replica| {
-            replica.name == name
-                && replica.target == target
-                && replica.local_path.contains("/.staging/")
-        })
-    })
 }
 
 /// Print every tracked snapshot.

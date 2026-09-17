@@ -83,15 +83,15 @@ pub struct Args {
     #[arg(long = "exclude", requires = "target", value_name = "PATH")]
     pub exclude: Vec<String>,
 
-    /// Restore from a replica instead of from the local snapshot. The target is taken from the
-    /// database; give one (an absolute path or ssh://user@host:port/path) to pick between several.
+    /// With --restore, restore from a replica instead of from the local snapshot; with --del, delete the replica
+    /// at its target instead of the local snapshot. The target is taken from the database; give one (an absolute
+    /// path or ssh://user@host:port/path) to pick between several.
     #[arg(
         long = "from-replica",
         value_name = "TARGET",
         num_args = 0..=1,
         default_missing_value = "",
-        requires = "restore_snapshot",
-        conflicts_with_all = ["create_snapshot", "delete_snapshot", "clean_snapshots", "send_snapshots"]
+        conflicts_with_all = ["create_snapshot", "clean_snapshots", "send_snapshots"]
     )]
     pub from_replica: Option<String>,
     /// Show what would be created, deleted, restored or sent without doing it.
@@ -139,6 +139,9 @@ impl Args {
         // behaviour of restoring to the directory the snapshot was taken from.
         if args.restore_snapshot && !from_command_line("dest_dir") {
             args.dest_dir.clear();
+        }
+        if args.from_replica.is_some() && !args.restore_snapshot && !args.delete_snapshot {
+            bail!("--from-replica works with --restore or --del");
         }
         if let Some(target) = &args.target {
             args.replicate = vec![ReplicateConfig {
