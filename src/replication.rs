@@ -212,10 +212,14 @@ impl Replication {
     ///
     /// # Errors
     ///
-    /// Fails if the target can't be reached.
+    /// Fails if the target can't be reached or the path can't be checked.
     pub fn exists(&self, path: &str) -> Result<bool> {
         match &self.target {
-            Target::Local { .. } => Ok(Path::new(path).exists()),
+            // `exists` would take an I/O error for a missing path, and a missing replica is
+            // forgotten or recorded as pruned.
+            Target::Local { .. } => Path::new(path)
+                .try_exists()
+                .with_context(|| format!("failed to check {path}")),
             Target::Ssh { .. } => {
                 // Runs as the ssh user (no root needed to stat the directory). The exit code
                 // of `test -e` alone can't be told apart from a broken ssh, so the result is
@@ -983,11 +987,24 @@ pub fn measure_excludes(snapshot_path: &str, excludes: &[String]) -> Result<Excl
 /// Locate an exclude entry inside a snapshot or filtered copy. The last component is not
 /// followed (a symlink is removed as a link), and the entry is refused when its parent resolves
 /// outside the root: a symlink inside the snapshot may point at the live system, and deleting
-/// through it would destroy live data. Returns `None` when the entry does not exist.
+/// through it would destroy live data. Returns `None` when the entry does not exist; any other
+/// failure to look it up is an error, since skipping the entry would send what it keeps out.
 fn locate_exclude(root: &str, entry: &str) -> Result<Option<PathBuf>> {
     let full = Path::new(root).join(entry);
-    if full.symlink_metadata().is_err() {
-        return Ok(None);
+    match full.symlink_metadata() {
+        Ok(_) => {}
+        // Missing, or something on the way is a file or a symlink loop: nothing is there.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", full.display()));
+        }
     }
     let real_root = Path::new(root)
         .canonicalize()
@@ -1570,6 +1587,28 @@ mod tests {
         assert!(Replication::from_config(&config).is_err());
     }
 
+    #[test]
+    fn local_exists_reports_errors_instead_of_absence() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!("rusnapshot-exists-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("locked")).unwrap();
+        let path = |name: &str| dir.join(name).to_str().unwrap().to_string();
+        let local = replication(dir.to_str().unwrap(), &[]);
+        assert!(local.exists(&path("locked")).unwrap());
+        assert!(!local.exists(&path("missing")).unwrap());
+
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any permission, so only an unprivileged run sees the error.
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(local.exists(&path("locked/x")).is_err());
+        }
+        fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn replication(target: &str, ssh_options: &[&str]) -> Replication {
         Replication::from_config(&ReplicateConfig {
             target: target.into(),
@@ -1780,7 +1819,9 @@ mod exclude_tests {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, vec![0u8; size]).unwrap();
         }
-        let excludes = normalize_excludes(&list(&["cache", "top", "missing/dir"])).unwrap();
+        // `keep/a/inside` goes through a file: nothing to leave out, like a missing path.
+        let excludes =
+            normalize_excludes(&list(&["cache", "top", "missing/dir", "keep/a/inside"])).unwrap();
         let staging = dir.to_str().unwrap();
 
         let measured = measure_excludes(staging, &excludes).unwrap();

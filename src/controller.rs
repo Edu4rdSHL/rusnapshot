@@ -490,7 +490,10 @@ fn delete_record(args: &Args, connection: &Connection, record: &SnapshotRecord) 
         return Ok(());
     }
 
-    let on_disk = Path::new(&path).exists();
+    // `exists` would take an I/O error for a missing snapshot and drop the row of one still here.
+    let on_disk = Path::new(&path)
+        .try_exists()
+        .with_context(|| format!("failed to check {path}"))?;
     if on_disk {
         operations::del_snapshot(&path)?;
     } else if record.machine != args.machine {
