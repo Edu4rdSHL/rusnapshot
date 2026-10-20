@@ -1502,6 +1502,44 @@ fn send_falls_back_to_an_older_parent_when_the_newest_is_gone_from_the_target() 
 }
 
 #[test]
+fn send_stops_when_none_of_the_recorded_replicas_is_at_the_target() {
+    let sb = Sandbox::new("send-target-empty");
+    sb.create(&["--prefix", "p"]);
+    assert!(sb.send(&["--prefix", "p"]).status.success());
+    let first = sb.records().remove(0).name;
+
+    // What an unmounted disk looks like when the target is its mount point: the directory is
+    // there, and empty.
+    fs::remove_dir_all(sb.target.join(&first)).unwrap();
+    sb.create(&["--prefix", "p"]);
+    let output = sb.send(&["--prefix", "p"]);
+    assert_failed(&output, "is the backup disk mounted?");
+    assert_eq!(
+        sb.log().matches("btrfs send").count(),
+        1,
+        "nothing must be sent"
+    );
+    assert_eq!(sb.replicas().len(), 1, "the replica must not be forgotten");
+    assert!(sb.replicas_on_disk().is_empty());
+
+    // When it is gone for good, forgetting it by hand lets the next send go on.
+    let output = sb.run(&[
+        "--del",
+        "--from-replica",
+        sb.target_str(),
+        "--id",
+        &first,
+        "-d",
+        sb.db_path(),
+    ]);
+    assert!(output.status.success(), "{}", text(&output));
+    let output = sb.send(&["--prefix", "p"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(stdout(&output).contains("full send"), "{}", text(&output));
+    assert_eq!(sb.replicas().len(), 1);
+}
+
+#[test]
 fn send_prunes_the_target_per_kind_with_keep_from_the_config() {
     let sb = Sandbox::new("send-prune");
     let config = sb.write(

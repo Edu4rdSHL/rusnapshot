@@ -647,6 +647,9 @@ fn replicate_to(
             replication.url
         );
     }
+    if !args.dry_run {
+        check_recorded_replicas(connection, replication)?;
+    }
 
     if todo.is_empty() {
         println!(
@@ -705,6 +708,38 @@ fn replicate_to(
     }
 
     Ok(())
+}
+
+/// Refuse to go on when the database records replicas at this target and none of them is there.
+/// That is what a backup disk that is not mounted looks like when the target is its mount point:
+/// the directory is still there, empty, on the root filesystem. Going on would forget every
+/// replica and send full copies into that directory, hidden under the disk once it is mounted
+/// again. The newest replicas are checked first, so a mounted target costs a single check.
+///
+/// # Errors
+///
+/// Fails if the target can't be checked or none of the recorded replicas is present.
+fn check_recorded_replicas(connection: &Connection, replication: &Replication) -> Result<()> {
+    let recorded: Vec<ReplicaRecord> = database::list_replicas(connection)?
+        .into_iter()
+        .filter(|replica| replica.target == replication.url)
+        .collect();
+    if recorded.is_empty() {
+        return Ok(());
+    }
+    for replica in &recorded {
+        if replication.exists(&replication.subvolume_path(&replica.name))? {
+            return Ok(());
+        }
+    }
+
+    bail!(
+        "none of the {} replica(s) recorded for {} is present in {} (is the backup disk mounted?). If they are gone for good (deleted by hand, or the disk was replaced), forget each one with --del --from-replica {} --id <NAME>; --list shows them",
+        recorded.len(),
+        replication.url,
+        replication.target.path(),
+        replication.url
+    )
 }
 
 fn describe_parent(parent: Option<&ReplicaRecord>) -> String {
