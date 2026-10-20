@@ -1,6 +1,6 @@
 use {
     anyhow::Result,
-    rusnapshot::{args::Args, controller, database, operations, replication},
+    rusnapshot::{args::Args, controller, database, operations, replication, utils},
 };
 
 fn try_run() -> Result<()> {
@@ -38,6 +38,9 @@ fn try_run() -> Result<()> {
 }
 
 fn main() {
+    if let Err(err) = utils::raise_fd_limit() {
+        eprintln!("Warning: failed to raise the open files limit: {err}");
+    }
     if let Err(err) = try_run() {
         eprintln!("Error: {err:#}");
         std::process::exit(1);
