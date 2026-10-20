@@ -15,11 +15,11 @@ use {
     anyhow::{Context, Result, anyhow, bail},
     sqlite::Connection,
     std::{
-        ffi::CString,
+        ffi::{CStr, CString, OsStr},
         fs, io,
         io::{IsTerminal, Read, Write},
         os::{
-            fd::{AsRawFd, FromRawFd, OwnedFd},
+            fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
             unix::ffi::OsStrExt,
         },
         path::{Component, Path, PathBuf},
@@ -1007,29 +1007,233 @@ fn locate_exclude(root: &str, entry: &str) -> Result<Option<PathBuf>> {
     Ok(Some(real_parent.join(name)))
 }
 
-fn tree_size(path: &Path) -> Result<u64> {
-    let metadata = path
-        .symlink_metadata()
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    if metadata.is_dir() {
-        let mut total = 0;
-        for entry in
-            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
-        {
-            total += tree_size(&entry?.path())?;
+/// What the walks below need to know about a directory entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Directory,
+    File,
+    /// Symlinks, device nodes, fifos and sockets.
+    Other,
+}
+
+impl Kind {
+    fn of(stat: &libc::stat) -> Self {
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => Self::Directory,
+            libc::S_IFREG => Self::File,
+            _ => Self::Other,
         }
-        Ok(total)
-    } else if metadata.is_file() {
-        Ok(metadata.len())
-    } else {
-        Ok(0)
     }
 }
 
+/// A directory entry. `kind` is `None` when the listing doesn't carry the type (`DT_UNKNOWN`).
+struct Entry {
+    name: CString,
+    kind: Option<Kind>,
+}
+
+/// One directory on the way down a walk: its descriptor and the entries still to visit.
+///
+/// Everything below it is reached by name relative to the descriptor (`openat`, `fstatat`,
+/// `unlinkat`), so neither the depth of the tree nor the length of its paths is a limit: `lstat`
+/// and `opendir` on a full path fail once it passes `PATH_MAX`, and recursing the way
+/// `remove_dir_all` does runs out of stack a few tens of thousands of levels down. The entries
+/// are read in one go when the directory is opened, so a level only keeps its descriptor open.
+///
+/// A level doesn't carry its path: the walks keep a single one for messages, extended and
+/// shortened as they go down and up, where one per level would grow with the square of the depth.
+struct Level {
+    fd: OwnedFd,
+    /// Name inside the parent directory.
+    name: CString,
+    entries: Vec<Entry>,
+}
+
+impl Level {
+    /// Open the directory `name` inside `parent`, refusing a symlink in its place, and list it.
+    /// `path` is where it is, for messages.
+    fn open(parent: &OwnedFd, name: &CStr, path: &Path) -> Result<Self> {
+        let fd = open_directory(parent.as_raw_fd(), name)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let entries =
+            read_entries(&fd).with_context(|| format!("failed to read {}", path.display()))?;
+
+        Ok(Self {
+            fd,
+            name: name.to_owned(),
+            entries,
+        })
+    }
+
+    /// `lstat` of the entry `name`; `path` is the directory's own, for messages.
+    fn stat(&self, name: &CStr, path: &Path) -> Result<libc::stat> {
+        stat_at(&self.fd, name)
+            .with_context(|| format!("failed to read {}", path.join(os_str(name)).display()))
+    }
+
+    fn kind(&self, entry: &Entry, path: &Path) -> Result<Kind> {
+        match entry.kind {
+            Some(kind) => Ok(kind),
+            None => Ok(Kind::of(&self.stat(&entry.name, path)?)),
+        }
+    }
+}
+
+fn os_str(name: &CStr) -> &OsStr {
+    OsStr::from_bytes(name.to_bytes())
+}
+
+fn c_string(value: &OsStr) -> io::Result<CString> {
+    CString::new(value.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+/// Open a directory for a walk, refusing a symlink in its place.
+fn open_directory(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
+    let raw = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `raw` was just opened here and is owned by nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The entries of a directory, without `.` and `..`.
+fn read_entries(dir: &OwnedFd) -> io::Result<Vec<Entry>> {
+    // The stream takes over the descriptor it is given and `closedir` closes it, so it gets a
+    // copy and `dir` stays usable for the rest of the walk.
+    let copy = dir.try_clone()?.into_raw_fd();
+    // SAFETY: `copy` is an open directory descriptor; on success the stream owns it.
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: no stream was created, so `copy` is still ours to close.
+        unsafe { libc::close(copy) };
+        return Err(err);
+    }
+
+    let mut entries = Vec::new();
+    let listed = loop {
+        // `readdir` returns null both at the end and on an error; only errno tells them apart.
+        // SAFETY: errno is thread local and writable.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `stream` stays open until the `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            break if err.raw_os_error() == Some(0) {
+                Ok(entries)
+            } else {
+                Err(err)
+            };
+        }
+        // SAFETY: a non-null entry is valid until the next `readdir` on the stream.
+        let (name, d_type) = unsafe { (CStr::from_ptr((*entry).d_name.as_ptr()), (*entry).d_type) };
+        if name == c"." || name == c".." {
+            continue;
+        }
+        let kind = match d_type {
+            libc::DT_DIR => Some(Kind::Directory),
+            libc::DT_REG => Some(Kind::File),
+            libc::DT_UNKNOWN => None,
+            _ => Some(Kind::Other),
+        };
+        entries.push(Entry {
+            name: name.to_owned(),
+            kind,
+        });
+    };
+    // SAFETY: `stream` is open and not used after this.
+    unsafe { libc::closedir(stream) };
+
+    listed
+}
+
+/// `lstat` of the entry `name` of `dir`.
+fn stat_at(dir: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
+    // SAFETY: `stat` is plain data, and all zeroes is a valid value for the kernel to overwrite.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the descriptor is open, `name` is NUL-terminated and the kernel writes one `stat`.
+    let done = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &raw mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if done != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(stat)
+}
+
+/// The directory holding `path`, opened, and the last component of `path`: where the walks start.
+fn open_parent(path: &Path) -> Result<(OwnedFd, &Path, CString)> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no name", path.display()))?;
+    let fd = open_directory(libc::AT_FDCWD, &c_string(parent.as_os_str())?)
+        .with_context(|| format!("failed to read {}", parent.display()))?;
+
+    Ok((fd, parent, c_string(name)?))
+}
+
+fn file_size(stat: &libc::stat) -> u64 {
+    u64::try_from(stat.st_size).unwrap_or(0)
+}
+
+/// Apparent size of the files at and under `path`, never following a symlink.
+fn tree_size(path: &Path) -> Result<u64> {
+    let (parent, _, name) = open_parent(path)?;
+    let stat =
+        stat_at(&parent, &name).with_context(|| format!("failed to read {}", path.display()))?;
+    match Kind::of(&stat) {
+        Kind::File => return Ok(file_size(&stat)),
+        Kind::Other => return Ok(0),
+        Kind::Directory => {}
+    }
+
+    let mut total = 0;
+    // Path of the directory on top of the stack.
+    let mut current = path.to_path_buf();
+    let mut stack = vec![Level::open(&parent, &name, &current)?];
+    while let Some(level) = stack.last_mut() {
+        let Some(entry) = level.entries.pop() else {
+            stack.pop();
+            current.pop();
+            continue;
+        };
+        let stat = level.stat(&entry.name, &current)?;
+        match Kind::of(&stat) {
+            Kind::Directory => {
+                current.push(os_str(&entry.name));
+                let below = Level::open(&level.fd, &entry.name, &current)?;
+                stack.push(below);
+            }
+            Kind::File => total += file_size(&stat),
+            Kind::Other => {}
+        }
+    }
+
+    Ok(total)
+}
+
 /// Delete the excluded paths inside a filtered copy, returning what was removed. Entries that
-/// don't exist in the snapshot are ignored. Sizes come from a read-only walk; the deletion itself
-/// is done by the standard library, whose `remove_dir_all` never follows symlinks and is immune
-/// to a directory being swapped for a symlink while it runs.
+/// don't exist in the snapshot are ignored. Measuring and deleting walk the tree through
+/// directory descriptors and never follow a symlink: one is removed as a link, and a directory
+/// swapped for one while they run is refused instead of followed.
 ///
 /// # Errors
 ///
@@ -1040,78 +1244,88 @@ pub fn remove_excludes(staging: &str, excludes: &[String]) -> Result<Excluded> {
         if let Some(path) = locate_exclude(staging, entry)? {
             excluded.paths += 1;
             excluded.bytes += tree_size(&path)?;
-            let metadata = path
-                .symlink_metadata()
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            remove_excluded(&path, metadata.is_dir())
-                .with_context(|| format!("failed to remove {}", path.display()))?;
+            remove_tree(&path)?;
         }
     }
 
     Ok(excluded)
 }
 
-/// Remove one excluded entry. The fast path is the standard library, which handles every ordinary
-/// tree; when something below carries the immutable or append-only attribute the kernel refuses
-/// the `unlink` with `EPERM` even for root, and the tree is walked again clearing the attribute
-/// from whatever refuses to go away.
+/// Remove `path` and everything under it. What refuses to go away because of the immutable or
+/// append-only attribute (the kernel says `EPERM`, even to root) gets the attribute cleared
+/// first; see [`unlink_at`].
 ///
 /// Clearing only ever happens inside the throwaway read-write copy under `.staging`: the snapshot
 /// it was made from is read-only and the live filesystem is never reached, so a file protected
 /// with `chattr +i` keeps its attribute everywhere it matters.
-fn remove_excluded(path: &Path, is_dir: bool) -> io::Result<()> {
-    let removed = if is_dir {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    };
-    match removed {
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => force_remove(path),
-        other => other,
+fn remove_tree(path: &Path) -> Result<()> {
+    let (parent, parent_path, name) = open_parent(path)?;
+    let stat =
+        stat_at(&parent, &name).with_context(|| format!("failed to read {}", path.display()))?;
+    if Kind::of(&stat) != Kind::Directory {
+        return unlink_at(&parent, parent_path, &name, false)
+            .with_context(|| format!("failed to remove {}", path.display()));
     }
-}
 
-/// Remove `path` and everything under it, clearing attributes as needed. Symlinks are removed as
-/// links: the type comes from `symlink_metadata`, so the walk never descends through one.
-fn force_remove(path: &Path) -> io::Result<()> {
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        // `remove_dir_all` deletes as it goes, so part of the tree is already gone.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            force_remove(&entry?.path())?;
+    // Path of the directory on top of the stack.
+    let mut current = path.to_path_buf();
+    let mut stack = vec![Level::open(&parent, &name, &current)?];
+    while let Some(level) = stack.last_mut() {
+        if let Some(entry) = level.entries.pop() {
+            if level.kind(&entry, &current)? == Kind::Directory {
+                current.push(os_str(&entry.name));
+                let below = Level::open(&level.fd, &entry.name, &current)?;
+                stack.push(below);
+            } else {
+                unlink_at(&level.fd, &current, &entry.name, false).with_context(|| {
+                    format!(
+                        "failed to remove {}",
+                        current.join(os_str(&entry.name)).display()
+                    )
+                })?;
+            }
+            continue;
+        }
+        // Empty now: it goes from the directory above, the one the walk started from at the end.
+        if let Some(done) = stack.pop() {
+            current.pop();
+            let above = stack.last().map_or(&parent, |up| &up.fd);
+            unlink_at(above, &current, &done.name, true).with_context(|| {
+                format!(
+                    "failed to remove {}",
+                    current.join(os_str(&done.name)).display()
+                )
+            })?;
         }
     }
 
-    unlink(path, metadata.is_dir())
+    Ok(())
 }
 
-/// `unlink` or `rmdir`, retried once with the immutable and append-only attributes cleared from
-/// the entry and from the directory holding it: either of the two is enough to stop a removal,
-/// and an immutable directory is what stops an otherwise ordinary file from going away. Only the
-/// paths that really carried an attribute are reported, and a failure to clear is ignored so the
-/// caller sees the original removal error rather than a derived one.
-fn unlink(path: &Path, is_dir: bool) -> io::Result<()> {
+/// `unlinkat` of the entry `name` of `dir` (with `AT_REMOVEDIR` for a directory), retried once
+/// with the immutable and append-only attributes cleared from the entry and from `dir`: either
+/// of the two is enough to stop a removal, and an immutable directory is what stops an otherwise
+/// ordinary file from going away. Only what really carried an attribute is reported, and a
+/// failure to clear is ignored so the caller sees the original removal error rather than a
+/// derived one.
+fn unlink_at(dir: &OwnedFd, dir_path: &Path, name: &CStr, is_dir: bool) -> io::Result<()> {
+    let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
     let remove = || {
-        if is_dir {
-            fs::remove_dir(path)
+        // SAFETY: the descriptor is open and `name` is a valid NUL-terminated string.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } == 0 {
+            Ok(())
         } else {
-            fs::remove_file(path)
+            Err(io::Error::last_os_error())
         }
     };
     match remove() {
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            let mut cleared: Vec<&Path> = Vec::new();
-            if clear_attributes(path).unwrap_or(false) {
-                cleared.push(path);
+            let mut cleared: Vec<PathBuf> = Vec::new();
+            if clear_attributes_at(dir, name).unwrap_or(false) {
+                cleared.push(dir_path.join(os_str(name)));
             }
-            if let Some(parent) = path.parent()
-                && clear_attributes(parent).unwrap_or(false)
-            {
-                cleared.push(parent);
+            if clear_attributes(dir).unwrap_or(false) {
+                cleared.push(dir_path.to_path_buf());
             }
             let result = remove();
             if result.is_ok() {
@@ -1128,15 +1342,18 @@ fn unlink(path: &Path, is_dir: bool) -> io::Result<()> {
     }
 }
 
-/// Clear `FS_IMMUTABLE_FL` and `FS_APPEND_FL` on a path, reporting whether either of them was
-/// actually set: the caller uses that to name what it really touched. `O_NOFOLLOW` means a
-/// symlink inside the copy can never redirect this at something else.
-fn clear_attributes(path: &Path) -> io::Result<bool> {
-    let name = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
+/// Clear the attributes of the entry `name` of `dir`, see [`clear_attributes`]. Only regular
+/// files and directories are opened: `O_NOFOLLOW` keeps a symlink from redirecting this at
+/// something else, and opening a device node would reach its driver, which would also be the one
+/// receiving the attribute ioctl instead of the filesystem.
+fn clear_attributes_at(dir: &OwnedFd, name: &CStr) -> io::Result<bool> {
+    if Kind::of(&stat_at(dir, name)?) == Kind::Other {
+        return Ok(false);
+    }
+    // SAFETY: the descriptor is open and `name` is a valid NUL-terminated string.
     let raw = unsafe {
-        libc::open(
+        libc::openat(
+            dir.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
         )
@@ -1147,6 +1364,12 @@ fn clear_attributes(path: &Path) -> io::Result<bool> {
     // SAFETY: `raw` was just opened here and is owned by nothing else.
     let file = unsafe { OwnedFd::from_raw_fd(raw) };
 
+    clear_attributes(&file)
+}
+
+/// Clear `FS_IMMUTABLE_FL` and `FS_APPEND_FL` on an open file or directory, reporting whether
+/// either of them was actually set: the caller uses that to name what it really touched.
+fn clear_attributes(file: &OwnedFd) -> io::Result<bool> {
     let mut flags: libc::c_int = 0;
     // SAFETY: the descriptor is open and the kernel writes one `int` through the pointer.
     if unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &raw mut flags) } < 0 {
@@ -1471,11 +1694,11 @@ mod tests {
 mod exclude_tests {
     use {
         super::{
-            FS_IMMUTABLE_FL, clear_attributes, exclude_hash, measure_excludes, normalize_excludes,
-            remove_excludes, staging_path,
+            FS_IMMUTABLE_FL, clear_attributes_at, exclude_hash, measure_excludes,
+            normalize_excludes, open_directory, open_parent, remove_excludes, staging_path,
         },
         std::{
-            ffi::CString,
+            ffi::{CStr, CString},
             os::{
                 fd::{AsRawFd, FromRawFd, OwnedFd},
                 unix::ffi::OsStrExt,
@@ -1605,23 +1828,97 @@ mod exclude_tests {
     }
 
     #[test]
-    fn clearing_attributes_never_follows_a_symlink() {
+    fn clearing_attributes_only_opens_files_and_directories() {
         let base =
             std::env::temp_dir().join(format!("rusnapshot-exclude-attr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("target");
         let link = base.join("link");
+        let fifo = base.join("fifo");
         std::fs::write(&target, b"x").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_name` is a valid NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let (dir, _, _) = open_parent(&target).unwrap();
+        let name = |path: &Path| CString::new(path.file_name().unwrap().as_bytes()).unwrap();
 
         // A file with neither attribute set: nothing to clear, and it says so.
-        assert!(!clear_attributes(&target).unwrap());
-        // Through a symlink: refused by O_NOFOLLOW instead of reaching whatever it points at.
-        assert!(clear_attributes(&link).is_err());
+        assert!(!clear_attributes_at(&dir, &name(&target)).unwrap());
+        // A symlink or a fifo is never opened, so nothing behind them is reached.
+        assert!(!clear_attributes_at(&dir, &name(&link)).unwrap());
+        assert!(!clear_attributes_at(&dir, &name(&fifo)).unwrap());
         assert!(target.exists());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A chain of `depth` directories named `name` under `base`, built relative to each
+    /// descriptor because the full path soon passes what the kernel accepts. The deepest one
+    /// holds a file of `size` bytes.
+    fn deep_tree(base: &Path, depth: usize, name: &CStr, size: usize) {
+        let (parent, _, base_name) = open_parent(base).unwrap();
+        let mut dir = open_directory(parent.as_raw_fd(), &base_name).unwrap();
+        for _ in 0..depth {
+            // SAFETY: the descriptor is open and `name` is a valid NUL-terminated string.
+            assert_eq!(
+                unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) },
+                0
+            );
+            dir = open_directory(dir.as_raw_fd(), name).unwrap();
+        }
+        // SAFETY: the descriptor is open and the name is a valid NUL-terminated string.
+        let raw = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c"data".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        assert!(raw >= 0);
+        // SAFETY: `raw` was just opened here and is owned by nothing else.
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        std::io::Write::write_all(&mut file, &vec![0u8; size]).unwrap();
+    }
+
+    #[test]
+    fn measure_and_remove_a_tree_deeper_than_path_max() {
+        // One descriptor stays open per level, more than the usual soft limit of 1024.
+        crate::utils::raise_fd_limit().unwrap();
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: the kernel writes one `rlimit` through the pointer.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) },
+            0
+        );
+        if limit.rlim_cur < 4096 {
+            // A hard limit this low leaves nothing to exercise here.
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("rusnapshot-exclude-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("keep"), vec![0u8; 10]).unwrap();
+        // 1500 levels of 9 bytes each: a path of about 13.5 KiB, PATH_MAX is 4 KiB.
+        deep_tree(&dir.join("cache"), 1500, c"deep-tree", 70);
+
+        let excludes = normalize_excludes(&list(&["cache"])).unwrap();
+        let staging = dir.to_str().unwrap();
+        let measured = measure_excludes(staging, &excludes).unwrap();
+        assert_eq!((measured.paths, measured.bytes), (1, 70));
+        let removed = remove_excludes(staging, &excludes).unwrap();
+        assert_eq!((removed.paths, removed.bytes), (1, 70));
+        assert!(!dir.join("cache").exists());
+        assert!(dir.join("keep").exists(), "only the excluded path goes");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
